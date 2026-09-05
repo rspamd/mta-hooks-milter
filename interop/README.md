@@ -4,20 +4,25 @@ Verified on 2026-09-05 using Colima/Docker on an Apple Silicon Mac:
 
 - Postfix **3.7.11** (`3.7.11-0+deb12u1`), Debian bookworm, Linux aarch64.
 - Rust **1.90**, locked dependencies, the actual `mta-hooks-milter` executable.
-- Two full runs: **24 checks over TCP and 24 over Unix sockets**, both exit 0.
-- No Rust implementation changes were needed to pass these tests.
+- Two full runs after the idle-timeout fix: **25 checks over TCP and 25 over
+  Unix sockets**, both exit 0. The initial baseline had 24 checks per transport.
+- The new regression leaves an existing SMTP session quiet for 65 seconds, then
+  requires successful scanning, SMTP acceptance and the scanner-added queue
+  header. A paused-clock Rust regression failed before the fix at 61 seconds
+  and passes with separate idle and partial-frame deadlines.
 - HTTP scanner: a controlled Python standard-library draft-01 fixture written
   for this suite, not an independent third-party scanner. It has no external
   service dependencies and never forwards messages elsewhere.
 
 ## What was verified
 
-Each transport run submits 22 message scenarios through real SMTP. Assertions
+Each transport run submits 23 message scenarios through real SMTP. Assertions
 inspect both the received hook JSON/raw content and Postfix queue records:
 
 | Case | Required result |
 | --- | --- |
 | Normal acceptance and header addition | SMTP 250; added header exists in the queue |
+| 65-second pause on an existing SMTP session | Next message still scanned, accepted and queued with its added header |
 | Null envelope sender | HTTP envelope contains null; message accepted |
 | RSET and multiple messages on one SMTP connection | Fresh envelope/queue ID for each message |
 | Reject / temporary policy rejection | SMTP 550 / 451; no queued message |
@@ -38,7 +43,7 @@ The two additional top-level checks are quarantine's actual hold-queue state
 and the absent-bridge negative control. The harness also checks the complete set
 of retained queue IDs, so discarded/rejected/error messages cannot silently
 remain queued. Every queued message's queue ID must match the ID sent to the
-scanner. Both runs reported `milter_messages_total 22`,
+scanner. Both runs reported `milter_messages_total 23`,
 `milter_protocol_errors_total 0`, and `milter_policy_errors_total 3` (the three
 intentional malformed-response/unavailable/timeout cases).
 
@@ -84,8 +89,10 @@ The base image digests observed during this run were:
 
 The Dockerfile retains readable image tags; future rebuilds can pick up package
 updates. Test output always records the actual Postfix version. Locally captured
-raw logs are in `results/postfix-tcp.log` and `results/postfix-unix.log` (ignored by
-Git); the executable assertions in `postfix_test.py` are the portable evidence.
+raw baseline logs are in `results/postfix-tcp.log` and `results/postfix-unix.log`;
+the idle-fix runs are in `results/postfix-idle-tcp.log` and
+`results/postfix-idle-unix.log` (ignored by Git). The executable assertions in
+`postfix_test.py` are the portable evidence. Each run includes a 65-second wait.
 Captured logs are local evidence only and are excluded from the published crate.
 
 ## Independent scanner search

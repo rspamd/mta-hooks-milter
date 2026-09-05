@@ -43,6 +43,12 @@ struct Args {
     max_message_bytes: u32,
     #[arg(long,default_value_t=20_000,value_parser=clap::value_parser!(u64).range(1..))]
     policy_timeout_ms: u64,
+    /// Idle time before the next milter frame starts; 0 leaves it to Postfix.
+    #[arg(long, default_value_t = 0)]
+    milter_idle_timeout_ms: u64,
+    /// Absolute deadline to finish a milter frame once its first byte arrives.
+    #[arg(long,default_value_t=60_000,value_parser=clap::value_parser!(u64).range(1..))]
+    milter_frame_timeout_ms: u64,
     /// Continue filtering on scanner failure; default is temporary SMTP failure.
     #[arg(long)]
     fail_open: bool,
@@ -59,6 +65,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = Config {
         max_connections: args.max_connections as usize,
         policy_timeout: Duration::from_millis(args.policy_timeout_ms),
+        idle_timeout: (args.milter_idle_timeout_ms != 0)
+            .then(|| Duration::from_millis(args.milter_idle_timeout_ms)),
+        frame_timeout: Duration::from_millis(args.milter_frame_timeout_ms),
         fail_open: args.fail_open,
         ..Config::default()
     };
@@ -124,4 +133,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn shutdown_signal() -> std::io::Result<()> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {r=tokio::signal::ctrl_c()=>r,_=term.recv()=>Ok(())}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn milter_deadline_cli_defaults_and_overrides() {
+        let defaults = Args::try_parse_from(["bridge", "--passthrough"]).unwrap();
+        assert_eq!(defaults.milter_idle_timeout_ms, 0);
+        assert_eq!(defaults.milter_frame_timeout_ms, 60_000);
+        let args = Args::try_parse_from([
+            "bridge",
+            "--passthrough",
+            "--milter-idle-timeout-ms",
+            "600000",
+            "--milter-frame-timeout-ms",
+            "5000",
+        ])
+        .unwrap();
+        assert_eq!(args.milter_idle_timeout_ms, 600_000);
+        assert_eq!(args.milter_frame_timeout_ms, 5_000);
+        assert!(
+            Args::try_parse_from(["bridge", "--passthrough", "--milter-frame-timeout-ms", "0",])
+                .is_err()
+        );
+    }
 }

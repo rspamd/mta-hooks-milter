@@ -189,6 +189,12 @@ def main():
         wait_port(2525, postfix)
         with connect() as smtp:
             submit(smtp, "accept-first")
+            # Postfix retains this milter socket for the SMTP session. A legal
+            # pause beyond the former 60-second frame/idle deadline must not
+            # lose filtering or fall back to milter_default_action.
+            print("WAIT 65 seconds on the existing SMTP session", flush=True)
+            time.sleep(65)
+            submit(smtp, "after-idle")
             submit(smtp, "null-sender", sender="")
             assert smtp.mail("aborted@example.test")[0] == 250
             assert smtp.rcpt("bob@localhost")[0] == 250

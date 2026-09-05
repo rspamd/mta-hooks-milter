@@ -100,6 +100,41 @@ semantics require their own integration validation. Supply required Postfix
 macros through its configuration; this implementation does not request custom
 macro lists during negotiation. Missing queue IDs remain null, never fabricated.
 
+### Timeout sizing
+
+Milter socket idle time and incomplete-frame time are separate:
+
+- `--milter-idle-timeout-ms` defaults to `0` (disabled). It limits waiting for
+  the first byte of the next frame, including the initial negotiation. The
+  library equivalent is `Config::idle_timeout: Option<Duration>` (`None` by
+  default). A configured idle deadline starts afresh after each callback/reply.
+- `--milter-frame-timeout-ms` defaults to `60000`. `Config::frame_timeout` is
+  an absolute deadline from the first length byte until the complete command
+  and payload arrive. Partial progress does not restart it. Time already spent
+  idle does not consume this budget.
+
+Postfix keeps the milter socket for the SMTP session; a quiet milter socket does
+not mean the SMTP session has ended. The normal default
+[`smtpd_timeout`](https://www.postfix.org/smtpd.8.html) is 300 seconds (10 seconds
+under overload), applied to SMTP network I/O, not the whole session. Delays
+between milter events can also include message reception and other SMTP work.
+Idle expiry is therefore opt-in: let Postfix own SMTP idle handling unless the
+deployment has an explicit upper bound on gaps between callbacks. If enabled,
+size it above that bound with margin, not merely above the frame deadline.
+An idle or partial-frame timeout closes the socket; Postfix then applies
+`milter_default_action`. Keep the milter listener private and use
+`--max-connections` to bound resources even when idle expiry is disabled.
+
+Postfix's [milter timeouts](https://www.postfix.org/MILTER_README.html)
+go in the other direction: `milter_connect_timeout` (default 30s) bounds connection
+and negotiation, `milter_command_timeout` (30s) bounds command exchanges, and
+`milter_content_timeout` (300s) bounds content exchanges. The example above
+overrides the latter two to 60s. Allow room for the bridge's policy evaluation
+(20s by default), reply writes (10s) and transport overhead inside the applicable
+Postfix timeout. Increasing those Postfix settings does not extend a separately
+configured bridge idle deadline. Shutdown cancels idle and partial-frame reads;
+only an in-flight policy callback/reply is drained.
+
 ## Library design
 
 | Module | Responsibility |
@@ -167,8 +202,9 @@ cannot be represented by this JSON adapter and triggers its failure policy.
 Defaults: 128 connections, 25,000,000 message bytes in the CLI (25 MiB in the
 library defaults), 1 MiB envelope data, 10,000 headers, 1,000 recipients, 64 KiB
 macro data, 1,000 modifications, 1 MiB HTTP response and 131,073 bytes per milter
-frame including opcode. Frame reads have a 60-second absolute deadline, policy
-evaluation 20 seconds, writes 10 seconds and shutdown draining 30 seconds.
+frame including opcode. Idle expiry is disabled by default; started frames have
+a 60-second absolute deadline. Policy evaluation has 20 seconds, writes 10
+seconds and shutdown draining 30 seconds. See timeout sizing above.
 Messages are buffered in memory; raw reconstruction, Base64 and JSON add copies.
 These are per-connection limits, **not** a global memory budget. Tune connection
 and message limits together; disk spooling and global byte admission remain work.

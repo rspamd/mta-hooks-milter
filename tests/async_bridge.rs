@@ -22,7 +22,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, DuplexStream, duplex},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, duplex},
     net::{TcpListener, TcpStream, UnixListener, UnixStream},
     sync::{Mutex, Notify},
     time::timeout,
@@ -169,7 +169,6 @@ async fn stalled_frame_has_absolute_deadline() {
         },
     )
     .await;
-    use tokio::io::AsyncWriteExt;
     client.write_all(&[0, 0]).await.unwrap();
     assert!(matches!(
         timeout(Duration::from_secs(1), task)
@@ -178,6 +177,144 @@ async fn stalled_frame_has_absolute_deadline() {
             .unwrap(),
         Err(Error::Timeout)
     ));
+}
+#[tokio::test(start_paused = true)]
+async fn smtp_idle_gap_does_not_use_the_frame_deadline() {
+    let (mut client, task, _, _) = driver(Arc::new(server::Passthrough), Config::default()).await;
+    negotiate(&mut client, 0).await;
+    send(&mut client, b'C', b"unknown\0U").await;
+    assert_eq!(recv(&mut client).await.command, b'c');
+    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !task.is_finished(),
+        "an SMTP pause must not expire the milter frame deadline"
+    );
+    message(&mut client).await;
+    assert_eq!(recv(&mut client).await.command, b'c');
+    send(&mut client, b'Q', b"").await;
+    task.await.unwrap().unwrap();
+}
+#[tokio::test(start_paused = true)]
+async fn initial_idle_wait_is_unlimited_by_default() {
+    let (mut client, task, _, _) = driver(Arc::new(server::Passthrough), Config::default()).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(600)).await;
+    tokio::task::yield_now().await;
+    assert!(!task.is_finished());
+    negotiate(&mut client, 0).await;
+    send(&mut client, b'Q', b"").await;
+    task.await.unwrap().unwrap();
+}
+#[tokio::test(start_paused = true)]
+async fn configured_idle_timeout_resets_between_commands() {
+    let (mut client, task, _, _) = driver(
+        Arc::new(server::Passthrough),
+        Config {
+            idle_timeout: Some(Duration::from_secs(90)),
+            ..Default::default()
+        },
+    )
+    .await;
+    negotiate(&mut client, 0).await;
+    send(&mut client, b'C', b"unknown\0U").await;
+    recv(&mut client).await;
+    for _ in 0..2 {
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        send(&mut client, b'H', b"client.example\0").await;
+        assert_eq!(recv(&mut client).await.command, b'c');
+    }
+    tokio::time::advance(Duration::from_secs(91)).await;
+    assert!(matches!(task.await.unwrap(), Err(Error::Timeout)));
+}
+#[tokio::test(start_paused = true)]
+async fn partial_frame_gets_its_full_budget_after_idle() {
+    let (mut client, task, _, _) = driver(
+        Arc::new(server::Passthrough),
+        Config {
+            idle_timeout: Some(Duration::from_secs(120)),
+            frame_timeout: Duration::from_secs(10),
+            ..Default::default()
+        },
+    )
+    .await;
+    let wire = Options {
+        version: 6,
+        actions: 0,
+        protocol: 0,
+    }
+    .frame()
+    .encode()
+    .unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(119)).await;
+    client.write_all(&wire[..1]).await.unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(9)).await;
+    client.write_all(&wire[1..]).await.unwrap();
+    assert_eq!(recv(&mut client).await.command, b'O');
+    send(&mut client, b'Q', b"").await;
+    task.await.unwrap().unwrap();
+}
+#[tokio::test(start_paused = true)]
+async fn partial_frame_deadline_covers_header_and_body_without_drip_resets() {
+    let wire = Options {
+        version: 6,
+        actions: 0,
+        protocol: 0,
+    }
+    .frame()
+    .encode()
+    .unwrap();
+    for split in [1, 4, 8] {
+        let (mut client, task, _, _) = driver(
+            Arc::new(server::Passthrough),
+            Config {
+                frame_timeout: Duration::from_secs(10),
+                ..Default::default()
+            },
+        )
+        .await;
+        client.write_all(&wire[..split]).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        client.write_all(&wire[split..split + 1]).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(matches!(task.await.unwrap(), Err(Error::Timeout)));
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn shutdown_cancels_idle_and_partial_frame_waits() {
+    for prefix in [&b""[..], &b"\0"[..]] {
+        let (mut client, task, _, stop) =
+            driver(Arc::new(server::Passthrough), Config::default()).await;
+        client.write_all(prefix).await.unwrap();
+        tokio::task::yield_now().await;
+        stop.cancel();
+        task.await.unwrap().unwrap();
+    }
+}
+#[tokio::test]
+async fn eof_is_clean_only_before_a_frame_starts() {
+    for partial in [false, true] {
+        let (mut client, task, _, _) =
+            driver(Arc::new(server::Passthrough), Config::default()).await;
+        if partial {
+            client.write_all(&[0]).await.unwrap();
+        }
+        client.shutdown().await.unwrap();
+        let result = task.await.unwrap();
+        if partial {
+            assert!(
+                matches!(result, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof)
+            );
+        } else {
+            result.unwrap();
+        }
+    }
 }
 #[tokio::test]
 async fn shutdown_completes_inflight_callback_before_closing() {

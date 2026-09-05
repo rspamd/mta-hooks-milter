@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
     net::{TcpListener, UnixListener},
     sync::Semaphore,
     task::JoinSet,
@@ -49,6 +49,10 @@ impl Policy for Passthrough {
 pub struct Config {
     pub limits: Limits,
     pub max_connections: usize,
+    /// Time to the first byte of the next frame. None leaves idle handling to
+    /// Postfix, whose SMTP session may be quiet between milter callbacks.
+    pub idle_timeout: Option<Duration>,
+    /// Absolute time to finish a frame after its first length byte arrives.
     pub frame_timeout: Duration,
     pub policy_timeout: Duration,
     pub write_timeout: Duration,
@@ -60,6 +64,7 @@ impl Default for Config {
         Self {
             limits: Limits::default(),
             max_connections: 128,
+            idle_timeout: None,
             frame_timeout: Duration::from_secs(60),
             policy_timeout: Duration::from_secs(20),
             write_timeout: Duration::from_secs(10),
@@ -97,9 +102,7 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     loop {
         let frame = tokio::select! {
             _=stop.cancelled()=>return Ok(()),
-            result=timeout(config.frame_timeout,protocol::read_frame(&mut stream,config.limits.frame_bytes))=>{
-                result.map_err(|_|Error::Timeout)??
-            }
+            result=read_next_frame(&mut stream,config)=>result?,
         };
         let Some(frame) = frame else {
             return Ok(());
@@ -150,6 +153,28 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
 }
+async fn read_next_frame<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    config: &Config,
+) -> Result<Option<protocol::Frame>> {
+    let mut first = [0; 1];
+    let read = stream.read(&mut first);
+    let count = match config.idle_timeout {
+        Some(idle) => timeout(idle, read).await.map_err(|_| Error::Timeout)??,
+        None => read.await?,
+    };
+    if count == 0 {
+        return Ok(None);
+    }
+    timeout(
+        config.frame_timeout,
+        protocol::read_frame_after_start(stream, first[0], config.limits.frame_bytes),
+    )
+    .await
+    .map_err(|_| Error::Timeout)?
+    .map(Some)
+}
+
 fn error_kind(error: &Error) -> &'static str {
     match error {
         Error::Timeout => "timeout",

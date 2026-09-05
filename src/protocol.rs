@@ -84,10 +84,21 @@ impl Frame {
 /// EOF at a frame boundary is normal; EOF inside a frame is an error.
 /// Callers must discard the stream if this future is cancelled midway.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> Result<Option<Frame>> {
-    let mut length = [0; 4];
-    if r.read(&mut length[..1]).await? == 0 {
+    let mut first = [0; 1];
+    if r.read(&mut first).await? == 0 {
         return Ok(None);
     }
+    read_frame_after_start(r, first[0], max).await.map(Some)
+}
+
+/// Complete a frame after its first length byte has already been consumed.
+/// This lets the driver apply a separate deadline to idle and partial reads.
+pub(crate) async fn read_frame_after_start<R: AsyncRead + Unpin>(
+    r: &mut R,
+    first: u8,
+    max: usize,
+) -> Result<Frame> {
+    let mut length = [first, 0, 0, 0];
     r.read_exact(&mut length[1..]).await?;
     let length = u32::from_be_bytes(length) as usize;
     if length == 0 {
@@ -99,7 +110,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> Result<O
     let mut data = vec![0; length];
     r.read_exact(&mut data).await?;
     let data = Bytes::from(data);
-    Ok(Some(Frame::new(data[0], data.slice(1..))))
+    Ok(Frame::new(data[0], data.slice(1..)))
 }
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> Result<()> {
     w.write_all(&frame.encode()?).await?;
