@@ -81,6 +81,92 @@ listener do not provide authentication or TLS.
 `--passthrough` explicitly selects a no-scanner development mode. It cannot be
 combined with `--scanner`. Use `cargo run -- --help` for available options.
 
+## Scanner HTTP transport
+
+Choose one authentication source: `MTA_HOOKS_TOKEN` / `--scanner-token`,
+`--scanner-token-file PATH`, or `--scanner-basic-user USER` together with
+`--scanner-basic-password-file PATH`. Prefer files to command-line secrets.
+Credential files are UTF-8, at most 8 KiB, with one optional trailing LF/CRLF;
+password spaces are preserved. Files are read once at startup, not hot-reloaded.
+Keep them readable only by the service account. Unset `MTA_HOOKS_TOKEN` when
+selecting file or Basic authentication: conflicting sources are rejected.
+Static JWTs can be supplied as bearer tokens; OAuth2/OIDC token acquisition and
+refresh are not implemented.
+
+TLS options apply to both registration and hooks:
+
+- `--scanner-ca PATH` adds a PEM CA bundle; repeat for multiple bundles.
+  Built-in roots remain trusted unless `--scanner-custom-roots-only` is set,
+  which requires a custom CA. Each PEM file is limited to 1 MiB.
+- `--scanner-identity PATH` loads a PEM client certificate chain and private key
+  for mutual TLS, in addition to the chosen HTTP authentication. Protect the key
+  file. Certificate and hostname verification remain mandatory.
+
+Transport controls:
+
+| Option | Default / behavior |
+| --- | --- |
+| `--scanner-proxy URL` | Explicit HTTP(S) proxy origin, without credentials; overrides all environment proxy settings, including `NO_PROXY` |
+| `--scanner-no-proxy` | Disables proxies entirely; mutually exclusive with the explicit proxy option |
+| `--scanner-connect-timeout-ms` | 5000, capped by the policy deadline |
+| `--scanner-pool-idle-timeout-ms` | 90000; positive idle-socket expiry |
+| `--scanner-pool-max-idle` | 16 sockets per host; 0 disables pooling; does not limit active requests |
+| `--scanner-gzip` | Opt-in gzip response negotiation/decompression; outgoing JSON is uncompressed |
+
+Without a proxy option, reqwest honors environment proxies and `NO_PROXY`.
+Use `--scanner-no-proxy` for direct loopback development if the service environment
+sets a proxy. A proxy can observe traffic metadata; plaintext development requests
+also expose their credentials and content to it. Authenticated proxies are not
+supported by the explicit proxy option in this pass.
+
+The 1 MiB HTTP response limit applies **after decompression**. Registration and
+hook requests share the same configured HTTP client and connection pool.
+The whole invocation, including registration waits and 404/410 recovery, remains
+bounded by `--policy-timeout-ms`; transport settings do not extend that budget.
+Standalone startup registration has the same total deadline.
+
+No application-level transport-error retry is added. A failed POST may already
+have been processed by the scanner. Reqwest retains its limited default retries
+for safe protocol-level rejections; the only bridge recovery is one registration
+renewal on hook 404/410, retaining the request ID and body.
+
+## Observability
+
+Use `--log-format json` for structured logs (text remains the default), and
+`RUST_LOG=mta_hooks_milter=debug` for per-connection and request lifecycle events.
+Connection spans carry a generated `session_id`; scanner spans carry the same
+`request_id` sent in `X-MTA-Hooks-Request-Id`, preserved across recovery. Logs
+include sanitized error categories, HTTP status codes and request elapsed time,
+not scanner URLs, credentials or message content. Enabling third-party HTTP
+trace logging separately can expose more detail; handle those logs accordingly.
+
+`/metrics` retains the existing counters and active-connection gauge and adds:
+
+- `milter_operations_active` and `milter_operations_total`, labeled by fixed
+  operation (`policy`, `registration`, `hook`, `registration_wait`) and, for the
+  counter, outcome. Registration wait measures mutex contention, not a mail queue.
+- `milter_operation_duration_seconds`, a histogram for the same operations.
+  Policy timing includes decision validation; HTTP operation timing includes
+  response parsing. Cancelled/dropped futures also release gauges and contribute
+  a duration sample with a `cancelled` outcome. Thus a policy timeout can appear
+  as `timeout` at the policy layer and `cancelled` at the inner HTTP layer.
+- `milter_connection_failures_total{kind=...}`, with bounded error categories,
+  and `milter_listener_up{transport="tcp"|"unix"}` for the active accept loop.
+- `milter_ready` and `milter_drain_total{outcome="graceful"|"forced"}`. Drain counts
+  shutdown attempts, not messages or connections; forced drain aborts remaining
+  tasks after the deadline.
+
+IDs, addresses and URLs are never metric labels. This daemon has one milter
+listener; use the scraper's target labels to distinguish deployed instances.
+The legacy `milter_protocol_errors_total` counts all connection-driver errors,
+including I/O and deadlines; use the classified counter for a breakdown.
+Readiness reflects startup/listener state, not continuous scanner health.
+
+The operational HTTP listener still has **no built-in authentication or TLS**.
+Keep the default loopback binding and use a protected authenticated TLS reverse
+proxy for remote scraping. OpenTelemetry/OTLP, systemd integration, OS packages
+and direct Unix-socket ownership/mode configuration remain follow-up work.
+
 ## Postfix configuration example
 
 For a dedicated test Postfix instance, merge the following into its configuration
@@ -143,6 +229,8 @@ only an in-flight policy callback/reply is drained.
 | `session` | Transport-independent SMTP/milter state and complete-decision validation |
 | `server` | Tokio TCP/Unix listeners, concurrency bounds, async `Policy`, deadlines and shutdown |
 | `hooks` | Reqwest HTTPS client, registration cache and JSON data-stage translation |
+| `transport` | Validated authentication, TLS, proxy and connection-pool settings |
+| `stats` | Bounded-cardinality counters, gauges and operation histograms |
 | `http` | Axum `/healthz`, `/readyz`, `/metrics` routes |
 
 `Policy::evaluate` returns a Send future borrowing an immutable session snapshot.

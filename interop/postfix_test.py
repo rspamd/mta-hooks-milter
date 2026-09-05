@@ -233,6 +233,13 @@ def main():
         assert "milter_protocol_errors_total 0\n" in metrics
         assert f"milter_messages_total {len(RESULTS)}\n" in metrics
         assert "milter_policy_errors_total 3\n" in metrics
+        for operation in ("policy", "registration", "hook", "registration_wait"):
+            assert f'milter_operations_active{{operation="{operation}"}} 0\n' in metrics
+        for operation in ("policy", "hook"):
+            assert f'milter_operation_duration_seconds_count{{operation="{operation}"}} {len(RESULTS)}\n' in metrics
+        for outcome in ("invalid", "http_status", "timeout"):
+            assert f'milter_operations_total{{operation="policy",outcome="{outcome}"}} 1\n' in metrics
+        assert f'milter_listener_up{{transport="{transport}"}} 1\n' in metrics
         print(metrics)
         bridge.terminate()
         bridge.wait(timeout=10)

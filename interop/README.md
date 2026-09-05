@@ -6,6 +6,9 @@ Verified on 2026-09-05 using Colima/Docker on an Apple Silicon Mac:
 - Rust **1.90**, locked dependencies, the actual `mta-hooks-milter` executable.
 - Two full runs after the idle-timeout fix: **25 checks over TCP and 25 over
   Unix sockets**, both exit 0. The initial baseline had 24 checks per transport.
+- Both 25-check runs were repeated after the HTTP transport/observability pass.
+  The harness now also checks in-flight gauge cleanup, callback/HTTP histogram
+  counts, classified policy failures and the selected listener's state.
 - The new regression leaves an existing SMTP session quiet for 65 seconds, then
   requires successful scanning, SMTP acceptance and the scanner-added queue
   header. A paused-clock Rust regression failed before the fix at 61 seconds
@@ -46,6 +49,9 @@ remain queued. Every queued message's queue ID must match the ID sent to the
 scanner. Both runs reported `milter_messages_total 23`,
 `milter_protocol_errors_total 0`, and `milter_policy_errors_total 3` (the three
 intentional malformed-response/unavailable/timeout cases).
+The latter classify as `invalid`, `http_status` and `timeout`, one each. Policy
+and hook duration histograms contain 23 samples; all operation gauges return to
+zero after the scenarios.
 
 This verifies Postfix's SMTP ingress path, not `non_smtpd_milters`, multiple
 milter chains, other Postfix versions, all negotiated flag combinations, or the
@@ -53,6 +59,10 @@ core's body/envelope edit APIs not currently exposed by the HTTP adapter.
 SMTP STARTTLS uses the container's test certificate; scanner HTTP is deliberately
 plaintext loopback via `--insecure-loopback`. Production HTTPS trust validation,
 certificate rollover and remote scanner behavior are not covered by this suite.
+Separate Rust transport tests use ephemeral certificates for custom-CA and mTLS
+success/failure cases, including a hostname-mismatch negative control. They also
+cover proxy selection, Basic authentication, pooling, gzip limits and JSON log
+correlation; these are local fixtures, not production deployment evidence.
 
 ## Reproduce on this Mac
 

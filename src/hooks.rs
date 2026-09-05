@@ -3,8 +3,9 @@
 //! this implementation enforces its documented local update allowlist.
 use crate::{
     protocol::{ADD_HEADERS, Error, Modification, QUARANTINE, Result},
-    server::{Policy, PolicyFuture},
+    server::{Policy, PolicyFuture, Stats},
     session::{Decision, EnvelopeAddress, Session, Stage, Verdict},
+    transport::{Authentication, TransportOptions, http_error},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
@@ -12,7 +13,8 @@ use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
+use tracing::Instrument;
 use uuid::Uuid;
 
 const PROPERTIES: &[&str] = &[
@@ -35,12 +37,13 @@ struct Registration {
 pub struct HooksClient {
     client: Client,
     registration_url: Url,
-    token: String,
+    authentication: Authentication,
     name: String,
     timeout: Duration,
     response_limit: usize,
     insecure_loopback: bool,
     registration: Mutex<Option<Arc<Registration>>>,
+    stats: Arc<Stats>,
 }
 impl HooksClient {
     pub async fn new(
@@ -50,32 +53,58 @@ impl HooksClient {
         timeout: Duration,
         insecure_loopback: bool,
     ) -> Result<Self> {
+        Self::with_options(
+            url,
+            Authentication::bearer(&token)?,
+            name,
+            timeout,
+            insecure_loopback,
+            TransportOptions::default(),
+            Arc::new(Stats::default()),
+        )
+        .await
+    }
+
+    /// Configure scanner authentication/transport and share metrics with the server.
+    pub async fn with_options(
+        url: Url,
+        authentication: Authentication,
+        name: String,
+        timeout: Duration,
+        insecure_loopback: bool,
+        transport: TransportOptions,
+        stats: Arc<Stats>,
+    ) -> Result<Self> {
         validate_url(&url, insecure_loopback)?;
-        if token.is_empty() {
-            return Err(Error::Invalid("scanner credentials required"));
-        }
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(timeout)
-            .connect_timeout(timeout.min(Duration::from_secs(5)))
-            .build()
-            .map_err(http_error)?;
+        let client = transport.build(timeout)?;
         let this = Self {
             client,
             registration_url: url,
-            token,
+            authentication,
             name,
             timeout,
             response_limit: 1024 * 1024,
             insecure_loopback,
             registration: Mutex::new(None),
+            stats,
         };
         // Fail startup visibly if the endpoint/credentials/registration are invalid.
-        this.registered().await?;
+        tokio::time::timeout(timeout, this.registered())
+            .await
+            .map_err(|_| Error::Timeout)??;
         Ok(this)
     }
+    async fn registration_lock(&self) -> MutexGuard<'_, Option<Arc<Registration>>> {
+        if let Ok(guard) = self.registration.try_lock() {
+            return guard;
+        }
+        let observation = self.stats.registration_wait.begin();
+        let guard = self.registration.lock().await;
+        observation.finish(&Ok(()));
+        guard
+    }
     async fn registered(&self) -> Result<Arc<Registration>> {
-        let mut guard = self.registration.lock().await;
+        let mut guard = self.registration_lock().await;
         if let Some(reg) = guard.as_ref()
             && reg
                 .expires
@@ -83,15 +112,29 @@ impl HooksClient {
         {
             return Ok(reg.clone());
         }
-        let response=self.client.post(self.registration_url.clone()).bearer_auth(&self.token).json(&json!({
+        let observation = self.stats.registration.begin();
+        let result = self.register().await;
+        observation.finish(&result);
+        match &result {
+            Ok(reg) => {
+                *guard = Some(reg.clone());
+                tracing::info!("scanner registration active");
+            }
+            Err(error) => tracing::warn!(kind = error.kind(), "scanner registration failed"),
+        }
+        result
+    }
+    async fn register(&self) -> Result<Arc<Registration>> {
+        let response=self.client.post(self.registration_url.clone()).header(reqwest::header::AUTHORIZATION, self.authentication.value()).json(&json!({
             "name":self.name,"version":env!("CARGO_PKG_VERSION"),"timeoutMs":self.timeout.as_millis() as u64,
             "serialization":"json","inbound":{"stages":["data"],"properties":PROPERTIES},"outbound":null,
         })).send().await.map_err(http_error)?;
         if response.status() != StatusCode::CREATED {
-            return Err(Error::Policy(format!(
-                "registration HTTP {}",
-                response.status().as_u16()
-            )));
+            tracing::warn!(
+                status = response.status().as_u16(),
+                "unexpected registration status"
+            );
+            return Err(Error::HttpStatus(response.status().as_u16()));
         }
         let value = bounded_json(response, self.response_limit).await?;
         let id = value["registrationId"]
@@ -149,44 +192,56 @@ impl HooksClient {
             endpoint,
             expires,
         });
-        *guard = Some(reg.clone());
         Ok(reg)
     }
-    async fn invoke(&self, session: &Session) -> Result<Decision> {
+    async fn invoke(&self, session: &Session, request_id: &str) -> Result<Decision> {
         let body = request(session)?;
-        let request_id = Uuid::new_v4().to_string();
         let mut reg = self.registered().await?;
         // One recovery attempt, bounded together with registration by the policy deadline.
         for attempt in 0..2 {
-            let response = self
-                .client
-                .post(reg.endpoint.clone())
-                .bearer_auth(&self.token)
-                .header("X-MTA-Hooks-Registration", &reg.id)
-                .header("X-MTA-Hooks-Request-Id", &request_id)
-                .json(&body)
-                .send()
-                .await
-                .map_err(http_error)?;
-            let status = response.status();
-            if attempt == 0 && matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
-                let mut guard = self.registration.lock().await;
-                if guard.as_ref().is_some_and(|r| r.id == reg.id) {
-                    *guard = None;
+            let observation = self.stats.hook.begin();
+            let result = self.hook(&reg, request_id, &body).await;
+            observation.finish(&result);
+            match result {
+                Ok(Some(value)) => return translate(value, session),
+                Ok(None) => return Ok(Decision::default()),
+                Err(Error::HttpStatus(status)) if attempt == 0 && matches!(status, 404 | 410) => {
+                    tracing::info!(status, "recovering scanner registration");
+                    let mut guard = self.registration_lock().await;
+                    if guard.as_ref().is_some_and(|r| r.id == reg.id) {
+                        *guard = None;
+                    }
+                    drop(guard);
+                    reg = self.registered().await?;
                 }
-                drop(guard);
-                reg = self.registered().await?;
-                continue;
+                Err(error) => return Err(error),
             }
-            if status == StatusCode::NO_CONTENT {
-                return Ok(Decision::default());
-            }
-            if status != StatusCode::OK {
-                return Err(Error::Policy(format!("hook HTTP {}", status.as_u16())));
-            }
-            return translate(bounded_json(response, self.response_limit).await?, session);
         }
         Err(Error::Policy("registration recovery exhausted".into()))
+    }
+    async fn hook(
+        &self,
+        reg: &Registration,
+        request_id: &str,
+        body: &Value,
+    ) -> Result<Option<Value>> {
+        let response = self
+            .client
+            .post(reg.endpoint.clone())
+            .header(reqwest::header::AUTHORIZATION, self.authentication.value())
+            .header("X-MTA-Hooks-Registration", &reg.id)
+            .header("X-MTA-Hooks-Request-Id", request_id)
+            .json(body)
+            .send()
+            .await
+            .map_err(http_error)?;
+        let status = response.status();
+        tracing::debug!(status = status.as_u16(), "scanner HTTP response");
+        match status {
+            StatusCode::NO_CONTENT => Ok(None),
+            StatusCode::OK => Ok(Some(bounded_json(response, self.response_limit).await?)),
+            _ => Err(Error::HttpStatus(status.as_u16())),
+        }
     }
 }
 impl Policy for HooksClient {
@@ -197,11 +252,26 @@ impl Policy for HooksClient {
         ADD_HEADERS | QUARANTINE
     }
     fn evaluate<'a>(&'a self, _: Stage, session: &'a Session) -> PolicyFuture<'a> {
-        Box::pin(self.invoke(session))
+        let request_id = Uuid::new_v4().to_string();
+        let span = tracing::info_span!("hooks_request", %request_id);
+        Box::pin(
+            async move {
+                let started = tokio::time::Instant::now();
+                tracing::debug!("scanner invocation started");
+                let result = tokio::time::timeout(self.timeout, self.invoke(session, &request_id))
+                    .await
+                    .map_err(|_| Error::Timeout)
+                    .and_then(|r| r);
+                tracing::debug!(
+                    outcome = result.as_ref().err().map_or("success", Error::kind),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "scanner invocation completed"
+                );
+                result
+            }
+            .instrument(span),
+        )
     }
-}
-fn http_error(_: reqwest::Error) -> Error {
-    Error::Policy("HTTP transport failure".into())
 }
 fn validate_url(url: &Url, insecure_loopback: bool) -> Result<()> {
     let local = url.host_str().is_some_and(|s| {
@@ -219,6 +289,58 @@ fn validate_url(url: &Url, insecure_loopback: bool) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod instrumentation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn registration_waiters_release_gauge_on_completion_and_cancellation() {
+        let url: Url = "https://unused.example.test/register".parse().unwrap();
+        let stats = Arc::new(Stats::default());
+        let client = HooksClient {
+            client: Client::new(),
+            registration_url: url.clone(),
+            authentication: Authentication::bearer("synthetic").unwrap(),
+            name: "fixture".into(),
+            timeout: Duration::from_secs(1),
+            response_limit: 1024,
+            insecure_loopback: false,
+            registration: Mutex::new(Some(Arc::new(Registration {
+                id: "fixture".into(),
+                endpoint: url,
+                expires: None,
+            }))),
+            stats: stats.clone(),
+        };
+        for cancelled in [true, false] {
+            let guard = client.registration.lock().await;
+            let mut waiter = Box::pin(client.registered());
+            tokio::select! {
+                biased;
+                _ = &mut waiter => panic!("must wait for held lock"),
+                _ = tokio::task::yield_now() => {},
+            }
+            assert_eq!(stats.registration_wait.active(), 1);
+            if cancelled {
+                drop(waiter);
+                drop(guard);
+            } else {
+                drop(guard);
+                assert_eq!(waiter.await.unwrap().id, "fixture");
+            }
+            assert_eq!(stats.registration_wait.active(), 0);
+        }
+        let metrics = stats.render();
+        assert!(metrics.contains(
+            "milter_operations_total{operation=\"registration_wait\",outcome=\"cancelled\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "milter_operations_total{operation=\"registration_wait\",outcome=\"success\"} 1\n"
+        ));
+    }
+}
+
 async fn bounded_json(mut response: Response, max: usize) -> Result<Value> {
     let ct = response
         .headers()

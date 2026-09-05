@@ -132,6 +132,12 @@ async fn policy_timeouts_tempfail_or_continue_and_connection_is_reusable() {
             );
         }
         assert_eq!(stats.policy_errors.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.policy.active(), 0);
+        assert!(
+            stats
+                .render()
+                .contains("milter_operations_total{operation=\"policy\",outcome=\"timeout\"} 2\n")
+        );
         send(&mut client, b'Q', b"").await;
         task.await.unwrap().unwrap();
     }
@@ -405,20 +411,22 @@ async fn tcp_milter_to_axum_scanner_to_header_reply_with_registration_recovery()
         true,
     )
     .await;
+    let stats = Arc::new(Stats::default());
     let policy = Arc::new(
-        HooksClient::new(
+        HooksClient::with_options(
             url,
-            "test-token".into(),
+            mta_hooks_milter::transport::Authentication::bearer("test-token").unwrap(),
             "test".into(),
             Duration::from_secs(2),
             true,
+            mta_hooks_milter::transport::TransportOptions::default(),
+            stats.clone(),
         )
         .await
         .unwrap(),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let stats = Arc::new(Stats::default());
     let stop = CancellationToken::new();
     let task = tokio::spawn(server::serve(
         server::Listener::Tcp(listener),
@@ -466,6 +474,22 @@ async fn tcp_milter_to_axum_scanner_to_header_reply_with_registration_recovery()
     scanner_task.abort();
     assert_eq!(stats.messages.load(Ordering::Relaxed), 1);
     assert_eq!(stats.active.load(Ordering::Relaxed), 0);
+    assert!(
+        stats.render().contains(
+            "milter_operations_total{operation=\"registration\",outcome=\"success\"} 2\n"
+        )
+    );
+    assert!(
+        stats
+            .render()
+            .contains("milter_operations_total{operation=\"hook\",outcome=\"http_status\"} 1\n")
+    );
+    assert!(
+        stats
+            .render()
+            .contains("milter_operations_total{operation=\"hook\",outcome=\"success\"} 1\n")
+    );
+    assert_eq!(stats.drain_graceful.load(Ordering::Relaxed), 1);
 }
 #[tokio::test]
 async fn malformed_hook_response_cannot_partially_mutate_message() {
@@ -541,7 +565,7 @@ async fn axum_readiness_and_prometheus_routes() {
         200
     );
     let response = app.oneshot(get("/metrics")).await.unwrap();
-    let body = axum::body::to_bytes(response.into_body(), 4096)
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
         .unwrap();
     assert!(
@@ -568,8 +592,59 @@ async fn unix_socket_and_concurrent_connections() {
     negotiate(&mut first, 0).await;
     negotiate(&mut second, 0).await;
     assert_eq!(stats.active.load(Ordering::Relaxed), 2);
+    assert!(
+        stats
+            .render()
+            .contains("milter_listener_up{transport=\"unix\"} 1\n")
+    );
     stop.cancel();
     task.await.unwrap().unwrap();
     assert_eq!(stats.active.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.drain_graceful.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.drain_forced.load(Ordering::Relaxed), 0);
+    assert!(
+        stats
+            .render()
+            .contains("milter_listener_up{transport=\"unix\"} 0\n")
+    );
     std::fs::remove_file(&path).unwrap();
+}
+
+#[tokio::test]
+async fn forced_drain_releases_policy_and_connection_gauges() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let stats = Arc::new(Stats::default());
+    let stop = CancellationToken::new();
+    let started = Arc::new(Notify::new());
+    let task = tokio::spawn(server::serve(
+        server::Listener::Tcp(listener),
+        Arc::new(SlowPolicy {
+            started: started.clone(),
+        }),
+        Config {
+            shutdown_timeout: Duration::from_millis(20),
+            ..Default::default()
+        },
+        stats.clone(),
+        stop.clone(),
+    ));
+    let mut client = TcpStream::connect(address).await.unwrap();
+    negotiate(&mut client, 0).await;
+    send(&mut client, b'C', b"unknown\0U").await;
+    recv(&mut client).await;
+    message(&mut client).await;
+    started.notified().await;
+    assert_eq!(stats.policy.active(), 1);
+    stop.cancel();
+    task.await.unwrap().unwrap();
+    assert_eq!(stats.active.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.policy.active(), 0);
+    assert_eq!(stats.drain_forced.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.drain_graceful.load(Ordering::Relaxed), 0);
+    assert!(
+        stats
+            .render()
+            .contains("milter_operations_total{operation=\"policy\",outcome=\"cancelled\"} 1\n")
+    );
 }

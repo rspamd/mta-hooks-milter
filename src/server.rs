@@ -1,3 +1,4 @@
+pub use crate::stats::Stats;
 use crate::{
     protocol::{self, Error, Result},
     session::{Decision, Limits, Session, Stage, Verdict},
@@ -5,10 +6,7 @@ use crate::{
 use std::{
     future::Future,
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 use tokio::{
@@ -19,6 +17,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 pub type PolicyFuture<'a> = Pin<Box<dyn Future<Output = Result<Decision>> + Send + 'a>>;
 /// Called serially per milter connection, concurrently across connections.
@@ -73,16 +72,6 @@ impl Default for Config {
         }
     }
 }
-#[derive(Default)]
-pub struct Stats {
-    pub ready: AtomicBool,
-    pub active: AtomicU64,
-    pub connections: AtomicU64,
-    pub overload: AtomicU64,
-    pub messages: AtomicU64,
-    pub errors: AtomicU64,
-    pub policy_errors: AtomicU64,
-}
 struct Active(Arc<Stats>);
 impl Drop for Active {
     fn drop(&mut self) {
@@ -113,6 +102,7 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             if stage == Stage::EndMessage {
                 stats.messages.fetch_add(1, Ordering::Relaxed);
             }
+            let observation = stages.contains(&stage).then(|| stats.policy.begin());
             let result = if stages.contains(&stage) {
                 timeout(config.policy_timeout, policy.evaluate(stage, &session))
                     .await
@@ -122,12 +112,19 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 Ok(Decision::default())
             };
             let result = result.and_then(|decision| session.complete(decision));
+            if let Some(observation) = observation {
+                observation.finish(&result);
+            }
             match result {
                 Ok(replies) => frames.extend(replies),
                 Err(error) => {
                     stats.policy_errors.fetch_add(1, Ordering::Relaxed);
                     // Do not log HTTP errors with URLs: query strings can contain credentials.
-                    tracing::warn!(stage=stage.hook_name(),kind=%error_kind(&error),"policy failed");
+                    tracing::warn!(
+                        stage = stage.hook_name(),
+                        kind = error.kind(),
+                        "policy failed"
+                    );
                     frames.extend(session.complete(Decision {
                         verdict: if config.fail_open {
                             Verdict::Continue
@@ -175,16 +172,6 @@ async fn read_next_frame<S: AsyncRead + Unpin>(
     .map(Some)
 }
 
-fn error_kind(error: &Error) -> &'static str {
-    match error {
-        Error::Timeout => "timeout",
-        Error::Policy(_) => "upstream",
-        Error::NotNegotiated => "capability",
-        Error::Limit(_) => "limit",
-        _ => "protocol",
-    }
-}
-
 pub enum Listener {
     Tcp(TcpListener),
     Unix(UnixListener),
@@ -219,11 +206,31 @@ pub async fn serve(
     let permits = Arc::new(Semaphore::new(config.max_connections));
     let mut tasks = JoinSet::new();
     let config = Arc::new(config);
+    let transport = match &listener {
+        Listener::Tcp(_) => "tcp",
+        Listener::Unix(_) => "unix",
+    };
+    stats
+        .listener
+        .store(if transport == "tcp" { 1 } else { 2 }, Ordering::Relaxed);
+    // Also clear listener state if the accept loop fails or its future is cancelled.
+    struct ListenerState<'a>(&'a Stats);
+    impl Drop for ListenerState<'_> {
+        fn drop(&mut self) {
+            self.0.listener.store(0, Ordering::Relaxed);
+            self.0.ready.store(false, Ordering::Relaxed);
+        }
+    }
+    let _listener_state = ListenerState(&stats);
+    tracing::info!(transport, "milter listener started");
     loop {
         tokio::select! {
             _=stop.cancelled()=>break,
             joined=tasks.join_next(),if !tasks.is_empty()=>{
-                if let Some(Err(error))=joined {tracing::error!(%error,"connection task failed");}
+                if let Some(Err(error))=joined {
+                    // Panic text from a custom policy may contain message data.
+                    tracing::error!(panicked=error.is_panic(),cancelled=error.is_cancelled(),"connection task failed");
+                }
             }
             accepted=listener.accept()=>{
                 let stream=accepted?;
@@ -234,25 +241,38 @@ pub async fn serve(
                 stats.active.fetch_add(1,Ordering::Relaxed);
                 let active=Active(stats.clone());
                 let (policy,config,stats,stop)=(policy.clone(),config.clone(),stats.clone(),stop.clone());
+                let span = tracing::info_span!("milter_session", session_id=%uuid::Uuid::new_v4(), transport);
                 tasks.spawn(async move {
                     let (_permit,_active)=(permit,active);
+                    tracing::debug!("connection accepted");
                     if let Err(error)=handle_connection(stream,policy.as_ref(),&config,&stats,stop).await {
-                        stats.errors.fetch_add(1,Ordering::Relaxed);
-                        tracing::debug!(kind=%error_kind(&error),"milter connection ended with error");
+                        stats.connection_error(&error);
+                        tracing::debug!(kind=error.kind(),"milter connection ended with error");
                     }
-                });
+                    tracing::debug!("connection closed");
+                }.instrument(span));
             }
         }
     }
     stats.ready.store(false, Ordering::Relaxed);
+    stats.listener.store(0, Ordering::Relaxed);
+    tracing::info!(connections = tasks.len(), "draining milter connections");
     if timeout(config.shutdown_timeout, async {
         while tasks.join_next().await.is_some() {}
     })
     .await
     .is_err()
     {
+        stats.drain_forced.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            connections = tasks.len(),
+            "milter drain deadline exceeded; aborting remaining tasks"
+        );
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
+    } else {
+        stats.drain_graceful.fetch_add(1, Ordering::Relaxed);
+        tracing::info!("milter drain completed");
     }
     Ok(())
 }

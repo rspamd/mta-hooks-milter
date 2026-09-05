@@ -48,6 +48,48 @@ pub enum Error {
     Timeout,
     #[error("policy failed: {0}")]
     Policy(String),
+    #[error("HTTP transport failure ({0})")]
+    HttpTransport(HttpErrorKind),
+    #[error("unexpected HTTP status {0}")]
+    HttpStatus(u16),
+}
+
+/// Sanitized transport categories: never retain URLs or upstream error text.
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+pub enum HttpErrorKind {
+    #[error("timeout")]
+    Timeout,
+    #[error("connect")]
+    Connect,
+    #[error("request")]
+    Request,
+    #[error("body")]
+    Body,
+    #[error("decode")]
+    Decode,
+    #[error("transport")]
+    Other,
+}
+
+impl Error {
+    /// Fixed, low-cardinality label, safe for logs and metrics.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Timeout | Self::HttpTransport(HttpErrorKind::Timeout) => "timeout",
+            Self::HttpTransport(HttpErrorKind::Connect) => "connect",
+            Self::HttpTransport(HttpErrorKind::Request) => "request",
+            Self::HttpTransport(HttpErrorKind::Body) => "body",
+            Self::HttpTransport(HttpErrorKind::Decode) => "decode",
+            Self::HttpTransport(HttpErrorKind::Other) => "transport",
+            Self::HttpStatus(_) => "http_status",
+            Self::Io(_) => "io",
+            Self::Invalid(_) => "invalid",
+            Self::Limit(_) => "limit",
+            Self::Sequence { .. } => "protocol",
+            Self::NotNegotiated => "capability",
+            Self::Policy(_) => "upstream",
+        }
+    }
 }
 pub type Result<T> = std::result::Result<T, Error>;
 

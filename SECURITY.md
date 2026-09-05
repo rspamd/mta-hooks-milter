@@ -24,8 +24,12 @@ addresses, tokens, queue contents and other personal data from logs.
   sockets. They are unauthenticated and do not provide TLS themselves.
 - The scanner receives message content and controls mail outcomes. Use a trusted
   scanner over verified HTTPS; `--insecure-loopback` is for local testing only.
-- Use `MTA_HOOKS_TOKEN` rather than a command-line token that may be visible in
-  process listings. Keep service environment files private.
+- Prefer `--scanner-token-file` or a Basic password file to command-line secrets
+  that may be visible in process listings. `MTA_HOOKS_TOKEN` remains supported.
+  Keep credential files, service environments and mutual-TLS private keys private.
+- Custom CAs and client identities do not disable certificate/hostname validation.
+  Audit proxy settings: environment proxies apply unless explicitly disabled or
+  replaced. A proxy also sees plaintext loopback-development credentials/content.
 - Align Postfix's timeouts and failure policy with the daemon. Scanner failure
   temporarily rejects mail by default; `--fail-open` explicitly permits bypass.
 - Per-connection byte limits are not a global memory budget. Tune concurrency
