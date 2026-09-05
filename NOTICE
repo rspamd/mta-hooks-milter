@@ -1,0 +1,11 @@
+mta-hooks-milter
+Copyright 2026 Vsevolod Stakhov
+
+The Rust implementation was developed with reference to the Rspamd milter
+implementation and protocol constants:
+  Rspamd src/libserver/milter.c — Copyright 2024 Vsevolod Stakhov
+  Rspamd src/libserver/milter_internal.h — Copyright 2017 Vsevolod Stakhov
+Rspamd is licensed under Apache License 2.0.
+
+The HTTP adapter follows a subset of draft-degennaro-mta-hooks-01, authored
+by Mauro De Gennaro. This does not imply endorsement or complete conformance.

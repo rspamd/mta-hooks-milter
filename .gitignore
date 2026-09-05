@@ -1,0 +1,10 @@
+/target/
+/interop/results/
+*.sock
+.env
+.env.*
+.DS_Store
+__pycache__/
+*.pyc
+*.pem
+*.key

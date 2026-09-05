@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Rust ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            rust: '1.90.0'
+          - os: ubuntu-24.04
+            rust: stable
+          - os: macos-15
+            rust: stable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        run: rustup toolchain install '${{ matrix.rust }}' --profile minimal
+      - name: Tests
+        run: cargo +${{ matrix.rust }} test --locked --all-targets
+      - name: Documentation tests
+        run: cargo +${{ matrix.rust }} test --locked --doc
+
+  quality:
+    name: Formatting, lint, docs and package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: '1.90.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        run: rustup toolchain install 1.90.0 --profile minimal --component rustfmt --component clippy
+      - run: cargo +1.90.0 fmt --all -- --check
+      - run: cargo +1.90.0 clippy --locked --all-targets -- -D warnings
+      - run: cargo +1.90.0 doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Check package contents
+        run: python3 scripts/check_package.py
+      - name: Build distributable source package (does not publish)
+        run: cargo +1.90.0 package --locked
+
+  postfix:
+    name: Postfix TCP and Unix interoperability
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build test image
+        run: docker build -t mta-hooks-postfix-interop:ci -f interop/Dockerfile .
+      - name: SMTP and queue assertions, no external networking
+        run: |
+          for transport in tcp unix; do
+            docker run --rm --network none --memory 1g --cpus 2 --pids-limit 256 \
+              -e MILTER_TRANSPORT="$transport" mta-hooks-postfix-interop:ci
+          done
+
+  audit:
+    name: Dependency advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo +stable install cargo-audit --version 0.22.2 --locked
+      - run: cargo +stable audit --deny warnings
