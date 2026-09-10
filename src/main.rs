@@ -1,12 +1,14 @@
 use clap::{Parser, ValueEnum};
 use mta_hooks_milter::{
-    hooks::HooksClient,
+    hooks::{HooksClient, HooksOptions},
     http,
     server::{self, Config, Listener, Passthrough, Policy, Stats},
+    session::Stage,
     transport::{Authentication, ProxyMode, TransportOptions, read_config_file, read_secret_file},
 };
 use std::{
-    path::PathBuf,
+    os::unix::fs::{FileTypeExt, PermissionsExt},
+    path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
@@ -20,9 +22,16 @@ struct Args {
     /// Postfix connects to this TCP milter listener.
     #[arg(long, default_value = "127.0.0.1:11332")]
     milter_listen: String,
-    /// Unix milter socket instead of TCP. Existing paths are never removed.
+    /// Unix milter socket instead of TCP. Existing paths are kept unless
+    /// --milter-unix-replace-stale finds nobody listening on them.
     #[arg(long)]
     milter_unix: Option<PathBuf>,
+    /// Octal permission bits applied to the Unix socket after binding (e.g. 0660).
+    #[arg(long, requires = "milter_unix", value_parser = parse_mode)]
+    milter_unix_mode: Option<u32>,
+    /// Remove an existing socket path only when it is a socket that refuses connections.
+    #[arg(long, requires = "milter_unix")]
+    milter_unix_replace_stale: bool,
     /// Read-only Axum health/readiness/Prometheus HTTP listener.
     #[arg(long, default_value = "127.0.0.1:8080")]
     http_listen: String,
@@ -64,6 +73,21 @@ struct Args {
     /// Accept/decompress gzip responses; does not compress outgoing JSON.
     #[arg(long, requires = "scanner")]
     scanner_gzip: bool,
+    /// Inbound stages to subscribe: connect, ehlo, mail, rcpt, data.
+    #[arg(long, requires = "scanner", value_delimiter = ',', default_value = "data", value_parser = parse_stage)]
+    scanner_stages: Vec<Stage>,
+    /// Extra attempts per hook after a connect error, HTTP 5xx or 429 (never after a timeout).
+    #[arg(long, requires = "scanner", default_value_t = 2)]
+    scanner_retries: u32,
+    /// Keep retrying transient startup registration failures for this long; 0 tries once.
+    #[arg(long, requires = "scanner", default_value_t = 0)]
+    scanner_startup_wait_ms: u64,
+    /// Skip the deregistration DELETE request on shutdown.
+    #[arg(long, requires = "scanner")]
+    scanner_no_deregister: bool,
+    /// Keep the MTA's configured macro lists instead of requesting the projection's.
+    #[arg(long, requires = "scanner")]
+    no_request_macros: bool,
     #[arg(long, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
     /// Explicit development mode: accept mail without an HTTP scanner.
@@ -86,6 +110,9 @@ struct Args {
     /// Absolute deadline to finish a milter frame once its first byte arrives.
     #[arg(long,default_value_t=60_000,value_parser=clap::value_parser!(u64).range(1..))]
     milter_frame_timeout_ms: u64,
+    /// SMFIR_PROGRESS keepalive interval while a policy callback is pending; 0 disables.
+    #[arg(long, default_value_t = 10_000)]
+    milter_progress_interval_ms: u64,
     /// Continue filtering on scanner failure; default is temporary SMTP failure.
     #[arg(long)]
     fail_open: bool,
@@ -95,6 +122,49 @@ struct Args {
 enum LogFormat {
     Text,
     Json,
+}
+fn parse_stage(name: &str) -> Result<Stage, String> {
+    Stage::from_hook_name(name.trim())
+        .ok_or_else(|| "expected connect, ehlo, mail, rcpt or data".to_owned())
+}
+fn parse_mode(text: &str) -> Result<u32, String> {
+    u32::from_str_radix(text.trim_start_matches("0o"), 8)
+        .ok()
+        .filter(|m| *m <= 0o777)
+        .ok_or_else(|| "expected octal permission bits such as 0660".to_owned())
+}
+/// Remove a leftover socket path only if it is a socket nobody answers on.
+async fn replace_stale_socket(path: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(std::io::Error::other(
+            "milter socket path exists and is not a socket",
+        ));
+    }
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::net::UnixStream::connect(path),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "milter socket path is in use by another listener",
+        )),
+        Ok(Err(e)) if matches!(e.kind(), std::io::ErrorKind::ConnectionRefused) => {
+            tracing::warn!("removing stale milter socket path");
+            std::fs::remove_file(path)
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "existing milter socket did not answer",
+        )),
+    }
 }
 
 impl Args {
@@ -170,6 +240,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = Config {
         max_connections: args.max_connections as usize,
         policy_timeout: Duration::from_millis(args.policy_timeout_ms),
+        progress_interval: (args.milter_progress_interval_ms != 0)
+            .then(|| Duration::from_millis(args.milter_progress_interval_ms)),
         idle_timeout: (args.milter_idle_timeout_ms != 0)
             .then(|| Duration::from_millis(args.milter_idle_timeout_ms)),
         frame_timeout: Duration::from_millis(args.milter_frame_timeout_ms),
@@ -177,9 +249,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Config::default()
     };
     config.limits.message_bytes = args.max_message_bytes as usize;
+    // Bind listeners before registering so a socket problem never leaves a
+    // scanner registration behind.
+    let listener = if let Some(path) = args.milter_unix.as_ref() {
+        if args.milter_unix_replace_stale {
+            replace_stale_socket(path).await?;
+        }
+        let listener = UnixListener::bind(path)?;
+        if let Some(mode) = args.milter_unix_mode {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        }
+        Listener::Unix(listener)
+    } else {
+        Listener::Tcp(TcpListener::bind(&args.milter_listen).await?)
+    };
+    let http_listener = TcpListener::bind(&args.http_listen).await?;
     let stats = Arc::new(Stats::default());
+    let mut hooks = None;
     let policy: Arc<dyn Policy> = if let Some(url) = &args.scanner {
-        Arc::new(
+        let mut stages = args.scanner_stages.clone();
+        stages.dedup();
+        let client = Arc::new(
             HooksClient::with_options(
                 url.clone(),
                 args.authentication()?,
@@ -187,20 +277,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.policy_timeout,
                 args.insecure_loopback,
                 args.transport()?,
+                HooksOptions {
+                    stages,
+                    retries: args.scanner_retries,
+                    startup_wait: Duration::from_millis(args.scanner_startup_wait_ms),
+                    deregister: !args.scanner_no_deregister,
+                    request_macros: !args.no_request_macros,
+                },
                 stats.clone(),
             )
             .await?,
-        )
+        );
+        hooks = Some(client.clone());
+        client
     } else {
         tracing::warn!("explicit passthrough mode: mail is not scanned");
         Arc::new(Passthrough)
     };
-    let listener = if let Some(path) = args.milter_unix.as_ref() {
-        Listener::Unix(UnixListener::bind(path)?)
-    } else {
-        Listener::Tcp(TcpListener::bind(&args.milter_listen).await?)
-    };
-    let http_listener = TcpListener::bind(&args.http_listen).await?;
     stats.ready.store(true, Ordering::Relaxed);
     let stop = CancellationToken::new();
     let http_stop = stop.clone();
@@ -227,6 +320,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !milter_task.is_finished() {
         milter_task.await??;
     }
+    // Connections have drained (or been aborted): no further hooks will be sent.
+    if let Some(hooks) = hooks {
+        let _ = hooks.deregister().await;
+    }
     if !http_task.is_finished()
         && tokio::time::timeout(Duration::from_secs(5), &mut http_task)
             .await
@@ -246,6 +343,7 @@ async fn shutdown_signal() -> std::io::Result<()> {
 mod tests {
     use super::Args;
     use clap::Parser;
+    use mta_hooks_milter::session::Stage;
 
     #[test]
     fn scanner_auth_and_transport_cli_validation() {
@@ -337,5 +435,48 @@ mod tests {
             Args::try_parse_from(["bridge", "--passthrough", "--milter-frame-timeout-ms", "0",])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn stage_socket_and_progress_cli_options() {
+        let args = Args::try_parse_from([
+            "bridge",
+            "--scanner",
+            "https://example.test/register",
+            "--scanner-token",
+            "synthetic",
+            "--scanner-stages",
+            "connect,rcpt,data",
+            "--scanner-retries",
+            "0",
+            "--scanner-startup-wait-ms",
+            "30000",
+            "--milter-unix",
+            "/tmp/socket",
+            "--milter-unix-mode",
+            "0660",
+            "--milter-unix-replace-stale",
+            "--milter-progress-interval-ms",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.scanner_stages,
+            vec![Stage::Connect, Stage::Recipient, Stage::EndMessage]
+        );
+        assert_eq!(args.milter_unix_mode, Some(0o660));
+        assert_eq!(args.scanner_retries, 0);
+        let defaults = Args::try_parse_from(["bridge", "--passthrough"]).unwrap();
+        assert_eq!(defaults.scanner_stages, vec![Stage::EndMessage]);
+        assert_eq!(defaults.milter_progress_interval_ms, 10_000);
+        for extra in [
+            vec!["--scanner-stages", "eom"],
+            vec!["--milter-unix-mode", "0660"],
+            vec!["--milter-unix", "/tmp/socket", "--milter-unix-mode", "999"],
+        ] {
+            assert!(
+                Args::try_parse_from(["bridge", "--passthrough"].into_iter().chain(extra)).is_err()
+            );
+        }
     }
 }

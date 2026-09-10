@@ -17,6 +17,48 @@ Verified on 2026-09-05 using Colima/Docker on an Apple Silicon Mac:
   for this suite, not an independent third-party scanner. It has no external
   service dependencies and never forwards messages elsewhere.
 
+Re-run on 2026-09-09 after the functionality pass (configurable stages, hook
+retries, progress keepalives, macro-list requests, deregistration), same
+Postfix 3.7.11 image and Colima profile: **26 checks over TCP and 26 over Unix
+sockets**, both exit 0. The harness now runs the bridge with a 1.5 s policy
+deadline, a 1 s `SMFIR_PROGRESS` interval and the default two hook retries.
+Observed on both transports: `milter_messages_total 23`,
+`milter_policy_errors_total 3`, `milter_hook_retries_total 2` (the 503 case
+received three requests with one request ID), `milter_progress_total 1` (Postfix
+accepted the keepalive during the scanner-timeout case and still applied the
+451), 25 hook samples against 23 policy samples, and one authenticated `DELETE`
+to the deregistration endpoint after SIGTERM. The bridge requested macro lists
+in every negotiation; queue IDs and client metadata continued to match the
+Postfix queue records. Raw logs: `results/postfix-robustness-{tcp,unix}.log`.
+
+Multi-stage run on 2026-09-10 (`HOOK_STAGES=all`, the bridge started with
+`--scanner-stages connect,ehlo,mail,rcpt,data`): **33 checks over TCP and 33
+over Unix sockets**, both exit 0, alongside the 26-check data-only runs repeated
+the same day. Per transport the scanner received 8 connect, 8 ehlo, 30 mail,
+30 rcpt and 29 data requests (103 policy evaluations, 105 hook requests with
+the two retries, 27 end-of-message events). Observed through real Postfix:
+
+- MAIL-stage reject: SMTP 550 with the scanner's text at `MAIL FROM`; the
+  session continues and the next message is scanned normally.
+- MAIL-stage discard: Postfix accepts the transaction, sends no further events
+  for it and retains nothing in the queue.
+- RCPT-stage reject (550) and temporary reject (451): only that recipient is
+  refused, the next RCPT request no longer lists it, and the data-stage
+  envelope contains the accepted recipient alone.
+- EHLO-stage `disconnect`: Postfix answers 421 and closes the session.
+- Data-stage edits: sender rewritten (`postcat -qe` shows the new `sender:`),
+  one recipient deleted and one added (`done_recipient:` versus `recipient:`),
+  a header value changed and one of two duplicate headers deleted, all in the
+  same response as the usual header addition.
+- Metadata: `/server` carries `myhostname`; the EHLO after STARTTLS carries
+  `/tls` with version and cipher bits from the requested macros; earlier
+  requests have `/tls` null. Postfix does not know the queue ID at MAIL time
+  (`/queue` was null in all 30 mail requests and present at data).
+
+The port-readiness probe is a bare TCP connection that Postfix also reports as
+a connect event, so the connect count is checked as a lower bound. Raw logs:
+`results/postfix-multistage-{tcp,unix}.log`.
+
 ## What was verified
 
 Each transport run submits 23 message scenarios through real SMTP. Assertions
@@ -40,10 +82,15 @@ inspect both the received hook JSON/raw content and Postfix queue records:
 | SMTP STARTTLS followed by EHLO | Filtering continues after the TLS transition |
 | Empty body, dot-stuffed lines, UTF-8 body bytes | Correct milter-visible body |
 | Four simultaneous SMTP sessions | All four scanned and correctly queued |
-| Bridge deliberately stopped | Postfix rejects MAIL temporarily; no silent bypass |
+| Bridge deliberately stopped | Postfix rejects EHLO or MAIL temporarily; no silent bypass |
+| Multi-stage only: sender denied at MAIL | SMTP 550 at `MAIL FROM`; next message scanned |
+| Multi-stage only: discard at MAIL | SMTP 250; no data hook, nothing queued |
+| Multi-stage only: recipient rejected/deferred at RCPT | 550 / 451 for that recipient; message queued for the other |
+| Multi-stage only: `disconnect` at EHLO | SMTP 421 and session closed |
+| Multi-stage only: envelope and header edits | Queue file shows new sender, swapped recipient, changed and deleted headers |
 
-The two additional top-level checks are quarantine's actual hold-queue state
-and the absent-bridge negative control. The harness also checks the complete set
+The three additional top-level checks are quarantine's actual hold-queue state,
+deregistration on shutdown and the absent-bridge negative control. The harness also checks the complete set
 of retained queue IDs, so discarded/rejected/error messages cannot silently
 remain queued. Every queued message's queue ID must match the ID sent to the
 scanner. Both runs reported `milter_messages_total 23`,
@@ -55,7 +102,7 @@ zero after the scenarios.
 
 This verifies Postfix's SMTP ingress path, not `non_smtpd_milters`, multiple
 milter chains, other Postfix versions, all negotiated flag combinations, or the
-core's body/envelope edit APIs not currently exposed by the HTTP adapter.
+core's body replacement API, which the HTTP adapter does not expose.
 SMTP STARTTLS uses the container's test certificate; scanner HTTP is deliberately
 plaintext loopback via `--insecure-loopback`. Production HTTPS trust validation,
 certificate rollover and remote scanner behavior are not covered by this suite.
@@ -80,6 +127,10 @@ docker --context colima-mta-hooks-interop run --rm --network none \
   mta-hooks-postfix-interop:local
 docker --context colima-mta-hooks-interop run --rm --network none \
   -e MILTER_TRANSPORT=unix mta-hooks-postfix-interop:local
+
+# All five inbound stages; add MILTER_TRANSPORT=unix for the Unix socket run.
+docker --context colima-mta-hooks-interop run --rm --network none \
+  -e HOOK_STAGES=all mta-hooks-postfix-interop:local
 
 colima stop mta-hooks-interop
 ```

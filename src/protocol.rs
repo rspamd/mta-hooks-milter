@@ -31,6 +31,69 @@ pub const NR_UNKNOWN: u32 = 1 << 17;
 pub const NR_EOH: u32 = 1 << 18;
 pub const NR_BODY: u32 = 1 << 19;
 pub const HEADER_LEADING_SPACE: u32 = 1 << 20;
+/// SMFIR_PROGRESS: keeps the MTA's command/content timer alive during slow callbacks.
+pub const PROGRESS: u8 = b'p';
+/// SMFIR_SHUTDOWN: the MTA replies 421 and closes the SMTP connection.
+pub const SHUTDOWN: u8 = b'4';
+
+/// Macro classes (SMFIM_*) for macro-list overrides in the negotiation reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MacroStage {
+    Connect = 0,
+    Helo = 1,
+    Mail = 2,
+    Recipient = 3,
+    Data = 4,
+    EndMessage = 5,
+    EndHeaders = 6,
+}
+impl MacroStage {
+    pub const ALL: [Self; 7] = [
+        Self::Connect,
+        Self::Helo,
+        Self::Mail,
+        Self::Recipient,
+        Self::Data,
+        Self::EndMessage,
+        Self::EndHeaders,
+    ];
+}
+
+/// Requested macro names per class. Postfix and Sendmail replace *all* their
+/// default lists when any override is sent, so every class is always encoded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MacroLists(pub Vec<(MacroStage, Vec<String>)>);
+impl MacroLists {
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|(_, names)| names.is_empty())
+    }
+    /// Space-separated names per class, validated for the wire format.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        for stage in MacroStage::ALL {
+            let mut list = String::new();
+            for (_, names) in self.0.iter().filter(|(s, _)| *s == stage) {
+                for name in names {
+                    if name.is_empty()
+                        || name
+                            .bytes()
+                            .any(|c| c == 0 || c.is_ascii_whitespace() || c.is_ascii_control())
+                    {
+                        return Err(Error::Invalid("macro name"));
+                    }
+                    if !list.is_empty() {
+                        list.push(' ');
+                    }
+                    list.push_str(name);
+                }
+            }
+            out.extend_from_slice(&(stage as u32).to_be_bytes());
+            out.extend_from_slice(list.as_bytes());
+            out.push(0);
+        }
+        Ok(out)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -172,6 +235,16 @@ impl Options {
             p.extend_from_slice(&n.to_be_bytes());
         }
         Frame::new(b'O', p)
+    }
+    /// Negotiation reply carrying macro-list overrides after the three words.
+    pub fn frame_with_macros(&self, macros: &MacroLists) -> Result<Frame> {
+        let mut frame = self.frame();
+        if !macros.is_empty() {
+            let mut p = frame.payload.to_vec();
+            p.extend_from_slice(&macros.encode()?);
+            frame.payload = Bytes::from(p);
+        }
+        Ok(frame)
     }
 }
 

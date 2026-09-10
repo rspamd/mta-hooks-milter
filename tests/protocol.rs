@@ -512,3 +512,101 @@ fn modifications_require_eom_and_smtp_reply_codes_are_validated() {
         [f(b'y', b"451 4.7.1 later\0")]
     );
 }
+
+#[test]
+fn macro_lists_follow_the_negotiation_words_and_cover_every_class() {
+    let offer = Options {
+        version: 6,
+        actions: SUPPORTED_ACTIONS,
+        protocol: 0,
+    }
+    .frame();
+    let mut plain = Session::new(Limits::default(), vec![Stage::EndMessage], 0);
+    let reply = plain.receive(offer.clone()).unwrap().frames.remove(0);
+    assert_eq!(reply.payload.len(), 12);
+    let mut s = Session::new(Limits::default(), vec![Stage::EndMessage], 0);
+    s.request_macros(MacroLists(vec![
+        (MacroStage::EndMessage, vec!["i".into()]),
+        (
+            MacroStage::Connect,
+            vec!["j".into(), "{client_addr}".into()],
+        ),
+        (MacroStage::Connect, vec!["{client_ptr}".into()]),
+    ]));
+    let reply = s.receive(offer.clone()).unwrap().frames.remove(0);
+    assert_eq!(reply.command, b'O');
+    assert_eq!(&reply.payload[..4], &6u32.to_be_bytes());
+    assert_eq!(&reply.payload[4..8], &0u32.to_be_bytes());
+    let mut expected = Vec::new();
+    for (class, list) in [
+        (0u32, "j {client_addr} {client_ptr}"),
+        (1, ""),
+        (2, ""),
+        (3, ""),
+        (4, ""),
+        (5, "i"),
+        (6, ""),
+    ] {
+        expected.extend_from_slice(&class.to_be_bytes());
+        expected.extend_from_slice(list.as_bytes());
+        expected.push(0);
+    }
+    assert_eq!(&reply.payload[12..], &expected[..]);
+    for bad in ["", "a b", "x\0", "{client_addr}\n"] {
+        let mut s = Session::new(Limits::default(), vec![], 0);
+        s.request_macros(MacroLists(vec![(MacroStage::Data, vec![bad.into()])]));
+        assert!(matches!(
+            s.receive(offer.clone()),
+            Err(Error::Invalid("macro name"))
+        ));
+    }
+    // An all-empty request keeps the MTA's defaults instead of clearing them.
+    let mut s = Session::new(Limits::default(), vec![], 0);
+    s.request_macros(MacroLists(vec![(MacroStage::Data, vec![])]));
+    assert_eq!(s.receive(offer).unwrap().frames[0].payload.len(), 12);
+}
+
+#[test]
+fn shutdown_verdict_ends_filtering_for_the_connection() {
+    for stage in [Stage::Connect, Stage::Recipient, Stage::EndMessage] {
+        let mut s = Session::new(Limits::default(), Stage::ALL.to_vec(), SUPPORTED_ACTIONS);
+        s.receive(options(0, SUPPORTED_ACTIONS)).unwrap();
+        let mut steps = vec![(b'C', &b"unknown\0U"[..])];
+        if stage != Stage::Connect {
+            steps.push((b'M', &b"<>\0"[..]));
+            steps.push((b'R', &b"<a@b>\0"[..]));
+        }
+        if stage == Stage::EndMessage {
+            steps.extend([(b'T', &b""[..]), (b'N', &b""[..]), (b'E', &b""[..])]);
+        }
+        for (cmd, p) in steps {
+            let step = s.receive(f(cmd, p)).unwrap();
+            if step.event.is_some() && step.event != Some(stage) {
+                s.complete(Decision::default()).unwrap();
+            }
+        }
+        let frames = s
+            .complete(Decision {
+                verdict: Verdict::Shutdown,
+                modifications: if stage == Stage::EndMessage {
+                    vec![Modification::AddHeader {
+                        name: "X".into(),
+                        value: "y".into(),
+                    }]
+                } else {
+                    vec![]
+                },
+            })
+            .unwrap_or_else(|e| panic!("{stage:?}: {e}"));
+        assert_eq!(frames, [Frame::empty(SHUTDOWN)]);
+        assert_eq!(s.state, State::Stopped);
+        assert!(s.message.recipients.is_empty());
+        assert!(matches!(
+            s.receive(f(b'M', b"<>\0")),
+            Err(Error::Sequence { .. })
+        ));
+        s.receive(f(b'A', b"")).unwrap();
+        assert_eq!(s.state, State::Stopped);
+        assert!(s.receive(f(b'Q', b"")).unwrap().close);
+    }
+}

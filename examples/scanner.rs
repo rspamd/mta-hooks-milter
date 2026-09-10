@@ -3,7 +3,7 @@ use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
-    routing::post,
+    routing::{delete, post},
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -13,6 +13,7 @@ async fn main() {
     let token = Arc::new(std::env::var("MTA_HOOKS_TOKEN").expect("set MTA_HOOKS_TOKEN"));
     let app = Router::new()
         .route("/register", post(register))
+        .route("/register/development", delete(deregister))
         .route("/hook", post(hook))
         .layer(DefaultBodyLimit::max(40 * 1024 * 1024))
         .with_state(token);
@@ -38,16 +39,37 @@ async fn register(
         StatusCode::CREATED,
         Json(json!({"registrationId":"development","status":"active",
         "createdAt":chrono::Utc::now().to_rfc3339(),"expiresAt":null,"hookEndpoint":"/hook",
+        "endpoints":{"deregistration":"/register/development"},
         "negotiated":{"serialization":"json","inbound":request["inbound"]}})),
+    )
+}
+async fn deregister(
+    State(token): State<Arc<String>>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<Value>) {
+    if !authorized(&headers, &token) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({})));
+    }
+    eprintln!("bridge deregistered");
+    (
+        StatusCode::OK,
+        Json(
+            json!({"registrationId":"development","status":"deregistered",
+        "deregisteredAt":chrono::Utc::now().to_rfc3339()}),
+        ),
     )
 }
 async fn hook(
     State(token): State<Arc<String>>,
     headers: HeaderMap,
-    Json(_request): Json<Value>,
+    Json(request): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     if !authorized(&headers, &token) {
         return (StatusCode::UNAUTHORIZED, Json(json!({})));
+    }
+    // Earlier stages (see --scanner-stages) carry no message; accept them unchanged.
+    if request["stage"] != "data" {
+        return (StatusCode::NO_CONTENT, Json(Value::Null));
     }
     if headers
         .get("x-mta-hooks-registration")

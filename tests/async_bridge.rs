@@ -7,7 +7,7 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use mta_hooks_milter::{
-    hooks::HooksClient,
+    hooks::{HooksClient, HooksOptions},
     http,
     protocol::*,
     server::{self, Config, Policy, PolicyFuture, Stats},
@@ -420,6 +420,7 @@ async fn tcp_milter_to_axum_scanner_to_header_reply_with_registration_recovery()
             Duration::from_secs(2),
             true,
             mta_hooks_milter::transport::TransportOptions::default(),
+            HooksOptions::default(),
             stats.clone(),
         )
         .await
@@ -647,4 +648,454 @@ async fn forced_drain_releases_policy_and_connection_gauges() {
             .render()
             .contains("milter_operations_total{operation=\"policy\",outcome=\"cancelled\"} 1\n")
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn progress_keepalives_are_sent_while_a_callback_is_pending() {
+    for interval in [Some(Duration::from_secs(1)), None] {
+        let config = Config {
+            policy_timeout: Duration::from_millis(2500),
+            progress_interval: interval,
+            ..Default::default()
+        };
+        let (mut client, task, stats, _) = driver(
+            Arc::new(SlowPolicy {
+                started: Arc::new(Notify::new()),
+            }),
+            config,
+        )
+        .await;
+        negotiate(&mut client, 0).await;
+        send(&mut client, b'C', b"unknown\0U").await;
+        recv(&mut client).await;
+        message(&mut client).await;
+        let expected = if interval.is_some() { 2 } else { 0 };
+        for _ in 0..expected {
+            assert_eq!(recv(&mut client).await, Frame::empty(PROGRESS));
+        }
+        assert_eq!(recv(&mut client).await, Frame::empty(b't'));
+        assert_eq!(stats.progress.load(Ordering::Relaxed), expected);
+        assert!(
+            stats
+                .render()
+                .contains(&format!("milter_progress_total {expected}\n"))
+        );
+        // The connection stays usable after keepalives.
+        message(&mut client).await;
+        for _ in 0..expected {
+            assert_eq!(recv(&mut client).await, Frame::empty(PROGRESS));
+        }
+        assert_eq!(recv(&mut client).await, Frame::empty(b't'));
+        send(&mut client, b'Q', b"").await;
+        task.await.unwrap().unwrap();
+    }
+}
+
+#[derive(Clone)]
+struct StageMock {
+    requests: Arc<Mutex<Vec<(HeaderMap, Value)>>>,
+    properties: Vec<&'static str>,
+    failures: Arc<AtomicUsize>,
+    deregistrations: Arc<Mutex<Vec<HeaderMap>>>,
+}
+async fn stage_register(
+    State(mock): State<StageMock>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    assert_eq!(
+        body["inbound"]["properties"],
+        json!(mta_hooks_milter::hooks::OFFERED_PROPERTIES)
+    );
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "registrationId":"stages","status":"active","expiresAt":null,"hookEndpoint":"/hook",
+            "endpoints":{"deregistration":"/register/stages","status":"/register/stages/status"},
+            "negotiated":{"serialization":"json","inbound":{
+                "stages":["data","rcpt","connect"],"properties":mock.properties}}
+        })),
+    )
+}
+async fn stage_hook(
+    State(mock): State<StageMock>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> (StatusCode, [(&'static str, &'static str); 1], Json<Value>) {
+    let mut requests = mock.requests.lock().await;
+    let keys: Vec<_> = body.as_object().unwrap().keys().cloned().collect();
+    let mut expected: Vec<String> = mock.properties.iter().map(|p| p[1..].to_owned()).collect();
+    expected.sort();
+    let mut keys = keys;
+    keys.sort();
+    assert_eq!(keys, expected);
+    requests.push((headers, body.clone()));
+    let retry = [("retry-after", "0")];
+    match body["stage"].as_str().unwrap() {
+        "connect" => (StatusCode::NO_CONTENT, retry, Json(Value::Null)),
+        "rcpt" if body["envelope"]["to"][0]["address"] == "bad@example.com" => (
+            StatusCode::OK,
+            retry,
+            Json(json!({"set":[{"path":"/action","value":"reject"},
+                {"path":"/response","value":{"code":550,"enhancedCode":"5.1.1","message":"No such user"}}]})),
+        ),
+        "rcpt" => (StatusCode::OK, retry, Json(json!({}))),
+        _ if mock.failures.fetch_sub(1, Ordering::Relaxed) > 0 => {
+            (StatusCode::SERVICE_UNAVAILABLE, retry, Json(json!({})))
+        }
+        _ => (
+            StatusCode::OK,
+            retry,
+            Json(
+                json!({"add":[{"path":"/message/headers","value":{"name":"X-Scanned","value":"yes"}}],
+                "set":[{"path":"/envelope/from","value":{"address":"rewritten@example.com"}}]}),
+            ),
+        ),
+    }
+}
+async fn stage_deregister(
+    State(mock): State<StageMock>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<Value>) {
+    mock.deregistrations.lock().await.push(headers);
+    (
+        StatusCode::OK,
+        Json(json!({"registrationId":"stages","status":"deregistered"})),
+    )
+}
+async fn stage_scanner(
+    properties: Vec<&'static str>,
+    failures: usize,
+) -> (reqwest::Url, StageMock, tokio::task::JoinHandle<()>) {
+    let mock = StageMock {
+        requests: Arc::new(Mutex::new(vec![])),
+        properties,
+        failures: Arc::new(AtomicUsize::new(failures)),
+        deregistrations: Arc::new(Mutex::new(vec![])),
+    };
+    let app = Router::new()
+        .route("/register", post(stage_register))
+        .route("/register/stages", axum::routing::delete(stage_deregister))
+        .route("/hook", post(stage_hook))
+        .with_state(mock.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/register", listener.local_addr().unwrap())
+        .parse()
+        .unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (url, mock, task)
+}
+async fn stage_client(url: reqwest::Url, stats: Arc<Stats>, retries: u32) -> HooksClient {
+    HooksClient::with_options(
+        url,
+        mta_hooks_milter::transport::Authentication::bearer("test-token").unwrap(),
+        "test".into(),
+        Duration::from_secs(2),
+        true,
+        mta_hooks_milter::transport::TransportOptions::default(),
+        HooksOptions {
+            stages: vec![Stage::Connect, Stage::Recipient, Stage::EndMessage],
+            retries,
+            ..HooksOptions::default()
+        },
+        stats,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn early_stages_negotiated_properties_macros_retries_and_deregistration() {
+    let properties = vec![
+        "/stage",
+        "/action",
+        "/envelope",
+        "/client",
+        "/rawMessage",
+        "/tls",
+        "/auth",
+        "/server",
+        "/queue",
+    ];
+    let (url, mock, scanner_task) = stage_scanner(properties, 2).await;
+    let stats = Arc::new(Stats::default());
+    let policy = Arc::new(stage_client(url, stats.clone(), 2).await);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(server::serve(
+        server::Listener::Tcp(listener),
+        policy.clone(),
+        Config::default(),
+        stats.clone(),
+        stop.clone(),
+    ));
+    let mut client = TcpStream::connect(address).await.unwrap();
+    write_frame(
+        &mut client,
+        &Options {
+            version: 6,
+            actions: SUPPORTED_ACTIONS,
+            protocol: 0,
+        }
+        .frame(),
+    )
+    .await
+    .unwrap();
+    let reply = recv(&mut client).await;
+    assert_eq!(reply.command, b'O');
+    let actions = u32::from_be_bytes(reply.payload[4..8].try_into().unwrap());
+    assert_eq!(
+        actions & (CHANGE_FROM | CHANGE_HEADERS | DELETE_RECIPIENT),
+        CHANGE_FROM | CHANGE_HEADERS | DELETE_RECIPIENT
+    );
+    assert!(
+        reply.payload[12..]
+            .windows(13)
+            .any(|w| w == b"{client_addr}")
+    );
+    send(
+        &mut client,
+        b'D',
+        b"Cj\0mx.example\0{daemon_addr}\x00192.0.2.9\0{daemon_port}\x0025\0{client_connections}\x003\0",
+    )
+    .await;
+    send(&mut client, b'C', b"mx\0\x34\x00\x19\x31\x39\x32.0.2.1\0").await;
+    assert_eq!(recv(&mut client).await, Frame::empty(b'c'));
+    send(
+        &mut client,
+        b'D',
+        b"H{tls_version}\0TLSv1.3\0{cipher}\0TLS_AES_256_GCM_SHA384\0{cipher_bits}\x00256\0",
+    )
+    .await;
+    send(&mut client, b'H', b"client.example\0").await;
+    assert_eq!(recv(&mut client).await, Frame::empty(b'c'));
+    send(
+        &mut client,
+        b'D',
+        b"Mi\0queue-2\0{auth_authen}\0alice\0{auth_type}\0PLAIN\0",
+    )
+    .await;
+    send(&mut client, b'M', b"<alice@example.com>\0").await;
+    assert_eq!(recv(&mut client).await, Frame::empty(b'c'));
+    send(&mut client, b'R', b"<bad@example.com>\0").await;
+    assert_eq!(
+        recv(&mut client).await,
+        string_frame(b'y', &[b"550 5.1.1 No such user"]).unwrap()
+    );
+    send(&mut client, b'R', b"<good@example.com>\0").await;
+    assert_eq!(recv(&mut client).await, Frame::empty(b'c'));
+    for (cmd, p) in [
+        (b'T', &b""[..]),
+        (b'L', &b"Subject\0test\0"[..]),
+        (b'N', &b""[..]),
+        (b'B', &b"hello\r\n"[..]),
+    ] {
+        send(&mut client, cmd, p).await;
+        assert_eq!(recv(&mut client).await.command, b'c');
+    }
+    send(&mut client, b'E', b"").await;
+    assert_eq!(
+        recv(&mut client).await,
+        Frame::new(b'h', Bytes::from_static(b"X-Scanned\0yes\0"))
+    );
+    assert_eq!(
+        recv(&mut client).await,
+        Frame::new(b'e', Bytes::from_static(b"<rewritten@example.com>\0"))
+    );
+    assert_eq!(recv(&mut client).await, Frame::empty(b'c'));
+    let requests = mock.requests.lock().await;
+    let stages: Vec<_> = requests
+        .iter()
+        .map(|(_, b)| b["stage"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(stages, ["connect", "rcpt", "rcpt", "data", "data", "data"]);
+    let connect = &requests[0].1;
+    assert!(
+        connect["envelope"].is_null()
+            && connect["rawMessage"].is_null()
+            && connect["tls"].is_null()
+    );
+    assert_eq!(connect["client"]["ip"], "192.0.2.1");
+    assert_eq!(connect["client"]["activeConnections"], 3);
+    assert_eq!(
+        connect["server"],
+        json!({"name":"mx.example","ip":"192.0.2.9","port":25})
+    );
+    assert!(connect["auth"].is_null() && connect["queue"].is_null());
+    let rcpt = &requests[1].1;
+    assert_eq!(
+        rcpt["envelope"]["to"],
+        json!([{"address":"bad@example.com","parameters":{}}])
+    );
+    assert_eq!(rcpt["tls"]["version"], "TLSv1.3");
+    assert_eq!(rcpt["tls"]["cipherBits"], 256);
+    assert_eq!(rcpt["auth"], json!({"login":"alice","method":"PLAIN"}));
+    assert_eq!(rcpt["queue"]["id"], "queue-2");
+    assert!(rcpt["rawMessage"].is_null());
+    let data = &requests[3].1;
+    assert_eq!(
+        data["envelope"]["to"],
+        json!([{"address":"good@example.com","parameters":{}}])
+    );
+    assert!(data["rawMessage"].is_string());
+    // Two 503 responses were retried with the same request identifier.
+    assert_eq!(
+        requests[3].0["x-mta-hooks-request-id"],
+        requests[5].0["x-mta-hooks-request-id"]
+    );
+    assert_eq!(
+        requests[3].0["x-mta-hooks-request-id"],
+        requests[4].0["x-mta-hooks-request-id"]
+    );
+    assert_ne!(
+        requests[1].0["x-mta-hooks-request-id"],
+        requests[2].0["x-mta-hooks-request-id"]
+    );
+    drop(requests);
+    send(&mut client, b'Q', b"").await;
+    stop.cancel();
+    task.await.unwrap().unwrap();
+    assert_eq!(stats.hook_retries.load(Ordering::Relaxed), 2);
+    assert!(stats.render().contains("milter_hook_retries_total 2\n"));
+    assert!(
+        stats
+            .render()
+            .contains("milter_operations_total{operation=\"hook\",outcome=\"http_status\"} 2\n")
+    );
+    policy.deregister().await.unwrap();
+    policy.deregister().await.unwrap();
+    let deregistrations = mock.deregistrations.lock().await;
+    assert_eq!(deregistrations.len(), 1);
+    assert_eq!(deregistrations[0]["x-mta-hooks-registration"], "stages");
+    assert_eq!(deregistrations[0]["authorization"], "Bearer test-token");
+    assert!(
+        stats.render().contains(
+            "milter_operations_total{operation=\"deregistration\",outcome=\"success\"} 1\n"
+        )
+    );
+    scanner_task.abort();
+}
+
+#[tokio::test]
+async fn retries_are_opt_out_and_registration_refuses_unconfirmed_stages_or_properties() {
+    let (url, mock, scanner_task) = stage_scanner(vec!["/stage", "/action", "/envelope"], 1).await;
+    let stats = Arc::new(Stats::default());
+    let policy = stage_client(url.clone(), stats.clone(), 0).await;
+    let mut session = Session::new(Limits::default(), Stage::ALL.to_vec(), 0);
+    session
+        .receive(
+            Options {
+                version: 6,
+                actions: 0,
+                protocol: 0,
+            }
+            .frame(),
+        )
+        .unwrap();
+    session.connection = Some(Connection {
+        hostname: Bytes::from_static(b"fixture"),
+        family: b'U',
+        port: None,
+        address: None,
+    });
+    session.message.sender = Some(EnvelopeAddress {
+        address: Bytes::from_static(b"<>"),
+        parameters: vec![],
+    });
+    let error = policy
+        .evaluate(Stage::EndMessage, &session)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), "http_status");
+    assert_eq!(mock.requests.lock().await.len(), 1);
+    assert_eq!(stats.hook_retries.load(Ordering::Relaxed), 0);
+    scanner_task.abort();
+    for (stages, properties) in [
+        (vec![Stage::EndMessage], vec!["/stage", "/action"]),
+        (
+            vec![Stage::Connect, Stage::Recipient, Stage::EndMessage],
+            vec!["/stage"],
+        ),
+        (
+            vec![Stage::Connect, Stage::Recipient, Stage::EndMessage],
+            vec!["/stage", "/action", "/senderAuth"],
+        ),
+    ] {
+        let (url, _, scanner_task) = stage_scanner(properties, 0).await;
+        let result = HooksClient::with_options(
+            url,
+            mta_hooks_milter::transport::Authentication::bearer("test-token").unwrap(),
+            "test".into(),
+            Duration::from_secs(2),
+            true,
+            mta_hooks_milter::transport::TransportOptions::default(),
+            HooksOptions {
+                stages,
+                ..HooksOptions::default()
+            },
+            Arc::new(Stats::default()),
+        )
+        .await;
+        assert_eq!(result.err().unwrap().kind(), "invalid");
+        scanner_task.abort();
+    }
+}
+
+#[tokio::test]
+async fn startup_registration_waits_for_a_late_scanner() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let url: reqwest::Url = format!("http://{address}/register").parse().unwrap();
+    let late = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mock = Mock {
+            registrations: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(vec![])),
+            response: json!({}),
+            reregister: false,
+        };
+        let app = Router::new()
+            .route("/register", post(register))
+            .with_state(mock);
+        let listener = TcpListener::bind(address).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
+    });
+    let stats = Arc::new(Stats::default());
+    for (wait, ok) in [(Duration::ZERO, false), (Duration::from_secs(10), true)] {
+        let result = HooksClient::with_options(
+            url.clone(),
+            mta_hooks_milter::transport::Authentication::bearer("test-token").unwrap(),
+            "test".into(),
+            Duration::from_secs(2),
+            true,
+            mta_hooks_milter::transport::TransportOptions::default(),
+            HooksOptions {
+                startup_wait: wait,
+                ..HooksOptions::default()
+            },
+            stats.clone(),
+        )
+        .await;
+        assert_eq!(result.is_ok(), ok, "wait {wait:?}");
+        if !ok {
+            assert_eq!(result.err().unwrap().kind(), "connect");
+        }
+    }
+    let metrics = stats.render();
+    let failures: u64 = metrics
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix(
+                "milter_operations_total{operation=\"registration\",outcome=\"connect\"} ",
+            )
+        })
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(failures >= 2, "{failures}");
+    late.abort();
 }

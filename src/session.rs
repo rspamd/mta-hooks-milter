@@ -1,5 +1,5 @@
 use crate::protocol::{
-    self as wire, Command, Connection, Error, Frame, Modification, Options, Result,
+    self as wire, Command, Connection, Error, Frame, MacroLists, Modification, Options, Result,
 };
 use bytes::Bytes;
 use std::collections::BTreeMap;
@@ -51,6 +51,10 @@ impl Stage {
             Self::Recipient => "rcpt",
             Self::EndMessage => "data",
         }
+    }
+    /// Parse an MTA Hooks inbound stage name.
+    pub fn from_hook_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.hook_name() == name)
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +124,7 @@ pub struct Session {
     pending: Option<Stage>,
     stages: Vec<Stage>,
     wanted_actions: u32,
+    macro_lists: MacroLists,
 }
 pub struct Step {
     pub frames: Vec<Frame>,
@@ -150,6 +155,8 @@ pub enum Verdict {
         enhanced: Option<String>,
         message: String,
     },
+    /// Ask the MTA to reply 421 and close the SMTP connection (SMFIR_SHUTDOWN).
+    Shutdown,
 }
 #[derive(Clone, Debug, Default)]
 pub struct Decision {
@@ -171,7 +178,13 @@ impl Session {
             stages,
             wanted_actions: wanted_actions & wire::SUPPORTED_ACTIONS,
             limits,
+            macro_lists: MacroLists::default(),
         }
+    }
+    /// Override the MTA's macro lists in the negotiation reply. Must be set
+    /// before negotiation; an empty request keeps the MTA's configured lists.
+    pub fn request_macros(&mut self, macro_lists: MacroLists) {
+        self.macro_lists = macro_lists;
     }
     fn require(&self, cmd: u8, states: &[State]) -> Result<()> {
         if states.contains(&self.state) {
@@ -278,7 +291,8 @@ impl Session {
                 actions: offered.actions & self.wanted_actions,
                 protocol: offered.protocol & protocol,
             };
-            step.frames.push(options.frame());
+            step.frames
+                .push(options.frame_with_macros(&self.macro_lists)?);
             self.options = Some(options);
             self.state = State::Negotiated;
             return Ok(step);
@@ -471,6 +485,7 @@ impl Session {
         }
         let mut rejected = false;
         let mut finished = false;
+        let mut disconnect = false;
         let final_frame = match &decision.verdict {
             Verdict::Continue => Frame::empty(b'c'),
             Verdict::Accept => {
@@ -517,6 +532,11 @@ impl Session {
                 rejected = true;
                 wire::string_frame(b'y', &[text.as_bytes()])?
             }
+            Verdict::Shutdown => {
+                rejected = true;
+                disconnect = true;
+                Frame::empty(wire::SHUTDOWN)
+            }
         };
         if final_frame.payload.len() + 1 > self.limits.frame_bytes {
             return Err(Error::Limit("SMTP reply"));
@@ -527,7 +547,11 @@ impl Session {
         }
         frames.push(final_frame);
         self.pending = None;
-        if rejected && stage == Stage::Recipient {
+        if disconnect {
+            // The MTA closes the SMTP session; only ABORT/QUIT should follow.
+            self.reset_message();
+            self.state = State::Stopped;
+        } else if rejected && stage == Stage::Recipient {
             self.message.recipients.pop();
             self.state = if self.message.recipients.is_empty() {
                 State::Mail

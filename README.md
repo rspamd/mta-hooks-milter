@@ -35,13 +35,17 @@ Build an optimized daemon with `cargo build --release --locked`, or install it
 from the checkout with `cargo install --path . --locked`. Crates.io installation
 is not available until a registry release has actually been published.
 
-Tests cover fragmented/coalesced frames, malformed packets, option negotiation,
-no-reply fallback, transaction reuse, abort and connection reuse, rejected RCPT
-state, macro scoping, binary content, output validation and size limits. Async
-tests use real loopback TCP/Unix sockets and an Axum scanner, plus in-memory I/O
-for timeout and shutdown checks. Socket tests need permission to bind locally.
+Tests cover fragmented/coalesced frames, malformed packets, option negotiation
+with macro-list requests, no-reply fallback, transaction reuse, abort and
+connection reuse, rejected RCPT state, disconnect verdicts, macro scoping,
+binary content, output validation and size limits. Async tests use real loopback
+TCP/Unix sockets and an Axum scanner (early stages, property negotiation,
+retries, deregistration, late scanner startup), plus in-memory I/O for timeout,
+progress keepalive and shutdown checks. Socket tests need permission to bind locally.
 Real Postfix 3.7.11 interoperability has also passed over TCP and Unix milter
-sockets, including SMTP STARTTLS. See [the interoperability report](interop/README.md)
+sockets, including SMTP STARTTLS, both with the default data-only subscription
+and with all five inbound stages (MAIL/RCPT rejections, EHLO disconnect,
+envelope and header edits verified in the queue). See [the interoperability report](interop/README.md)
 for evidence, reproducible commands and the remaining independent-scanner gap.
 
 ## Local demonstration
@@ -62,9 +66,10 @@ cargo run -- \
   --insecure-loopback
 ```
 
-The example scanner adds `X-MTA-Hooks: scanned`. It is a protocol fixture, not
-a full scanner implementation: no discovery, status or deregistration API.
-Do not use its accept-all policy or demonstration token in production.
+The example scanner adds `X-MTA-Hooks: scanned` at the data stage, accepts any
+earlier stage unchanged and answers deregistration. It is a protocol fixture,
+not a full scanner implementation: no discovery or status API. Do not use its
+accept-all policy or demonstration token in production.
 
 For a real scanner, pass its HTTPS registration URL and set `MTA_HOOKS_TOKEN`
 through the service environment. Startup fails if registration fails. HTTP is
@@ -74,9 +79,13 @@ cross-origin hook endpoints are refused to avoid forwarding credentials.
 
 The default milter endpoint is `127.0.0.1:11332`; the default administrative HTTP
 endpoint is `127.0.0.1:8080`. `--milter-unix /path/to/socket` selects a Unix socket.
-Existing socket paths are never deleted; the service manager owns permissions
-and cleanup. Keep both listeners private: milter and the administrative HTTP
-listener do not provide authentication or TLS.
+`--milter-unix-mode 0660` applies permission bits after binding; ownership stays
+with the service manager. An existing path is kept unless
+`--milter-unix-replace-stale` is set, which removes it only when it is a socket
+that refuses connections (a leftover from an unclean stop); a path that answers
+or is not a socket still fails startup. The socket file is not removed on exit.
+Keep both listeners private: milter and the administrative HTTP listener do not
+provide authentication or TLS.
 
 `--passthrough` explicitly selects a no-scanner development mode. It cannot be
 combined with `--scanner`. Use `cargo run -- --help` for available options.
@@ -125,10 +134,23 @@ The whole invocation, including registration waits and 404/410 recovery, remains
 bounded by `--policy-timeout-ms`; transport settings do not extend that budget.
 Standalone startup registration has the same total deadline.
 
-No application-level transport-error retry is added. A failed POST may already
-have been processed by the scanner. Reqwest retains its limited default retries
-for safe protocol-level rejections; the only bridge recovery is one registration
-renewal on hook 404/410, retaining the request ID and body.
+Hook requests follow the draft's retry guidance for *transient* failures only:
+a connect error, HTTP 5xx or 429 is retried up to `--scanner-retries` times
+(default 2) with exponential backoff from 100 ms, capped at 5 s plus jitter, and
+`Retry-After` (seconds) is honored up to the same cap. The request ID stays the
+same so the scanner can deduplicate. Timeouts are never retried: the scanner may
+still be processing the first attempt and the policy budget is shared. Set
+`--scanner-retries 0` to disable. Independently, one registration renewal is
+attempted on hook 404/410, also retaining the request ID. Everything stays inside
+`--policy-timeout-ms`; a retry that could not finish in time is not started.
+
+Startup registration is tried once by default. `--scanner-startup-wait-ms`
+keeps retrying transient failures (connection refused, timeouts, 5xx, 429) with
+the same backoff for that long, so the bridge can start before its scanner
+under a service manager. Authentication and schema failures remain immediately
+fatal. On shutdown, after milter connections have drained, the bridge sends a
+`DELETE` to the deregistration endpoint the scanner returned, if any
+(`--scanner-no-deregister` skips it); no hook is sent after that point.
 
 ## Observability
 
@@ -155,6 +177,10 @@ trace logging separately can expose more detail; handle those logs accordingly.
 - `milter_ready` and `milter_drain_total{outcome="graceful"|"forced"}`. Drain counts
   shutdown attempts, not messages or connections; forced drain aborts remaining
   tasks after the deadline.
+- `milter_progress_total`, the number of `SMFIR_PROGRESS` keepalives written
+  while callbacks were pending; `milter_hook_retries_total`, repeated hook
+  requests after transient scanner failures; and a `deregistration` operation
+  in the operation counters/histogram.
 
 IDs, addresses and URLs are never metric labels. This daemon has one milter
 listener; use the scraper's target labels to distinguish deployed instances.
@@ -183,8 +209,13 @@ milter_content_timeout = 60s
 The daemon does not install, configure or restart Postfix. Start with SMTP
 ingress only; `non_smtpd_milters`, chained filters, chroot socket paths and queue
 semantics require their own integration validation. Supply required Postfix
-macros through its configuration; this implementation does not request custom
-macro lists during negotiation. Missing queue IDs remain null, never fabricated.
+macros through its configuration, or let the bridge request them: by default
+the scanner policy sends macro-list overrides in the negotiation reply for the
+names its projection uses (`i`, `{client_addr}`, `{client_ptr}`, `{daemon_addr}`,
+`{tls_version}`, `{auth_authen}`, ...). Postfix and Sendmail replace *all* their
+configured lists when any override is present, so every class is sent
+explicitly. `--no-request-macros` keeps the MTA's own lists. Missing queue IDs
+remain null, never fabricated.
 
 ### Timeout sizing
 
@@ -215,11 +246,15 @@ Postfix's [milter timeouts](https://www.postfix.org/MILTER_README.html)
 go in the other direction: `milter_connect_timeout` (default 30s) bounds connection
 and negotiation, `milter_command_timeout` (30s) bounds command exchanges, and
 `milter_content_timeout` (300s) bounds content exchanges. The example above
-overrides the latter two to 60s. Allow room for the bridge's policy evaluation
-(20s by default), reply writes (10s) and transport overhead inside the applicable
-Postfix timeout. Increasing those Postfix settings does not extend a separately
-configured bridge idle deadline. Shutdown cancels idle and partial-frame reads;
-only an in-flight policy callback/reply is drained.
+overrides the latter two to 60s. While a policy callback is pending, the bridge
+writes an `SMFIR_PROGRESS` keepalive every `--milter-progress-interval-ms`
+(default 10 s; 0 disables), which restarts Postfix's command/content timer, so
+the policy deadline (20 s by default) no longer has to fit inside one Postfix
+timeout. Keep the interval well below the Postfix timeouts and still allow room
+for reply writes (10 s) and transport overhead. Increasing those Postfix
+settings does not extend a separately configured bridge idle deadline. Shutdown
+cancels idle and partial-frame reads; only an in-flight policy callback/reply is
+drained.
 
 ## Library design
 
@@ -247,8 +282,11 @@ Macros are scoped to the next matching command and reset between transactions,
 with CONNECT/HELO metadata retained.
 
 The core supports async CONNECT, HELO, MAIL, RCPT and EOM callbacks. It negotiates
-version 6, intersects offered capabilities and only suppresses replies where
-both parties agreed. It preserves incoming header/body bytes and ESMTP arguments.
+version 6, intersects offered capabilities, optionally appends macro-list
+requests (`Policy::macros`) and only suppresses replies where both parties
+agreed. Verdicts include continue/accept/reject/tempfail/discard, a custom SMTP
+reply and `Shutdown` (`SMFIR_SHUTDOWN`), after which the MTA closes the SMTP
+session and the state machine accepts only ABORT/QUIT. It preserves incoming header/body bytes and ESMTP arguments.
 Low-level modifications include add/insert/change/delete header, chunked body
 replacement, envelope sender/recipient changes and quarantine. Message edits
 are emitted only at EOM and only with negotiated capability bits. Header insert
@@ -259,27 +297,46 @@ Output header values must be unfolded and cannot contain CR, LF or NUL.
 
 This is **not a complete draft-01 MTA implementation**. Current adapter behavior:
 
-- One manually configured scanner; JSON and inbound `data` only, invoked at EOM.
+- One manually configured scanner; JSON only. `--scanner-stages` selects the
+  inbound stages (`connect`, `ehlo`, `mail`, `rcpt`, `data`; default `data`).
+  The scanner must confirm exactly the configured stages. Each stage produces
+  one hook request per milter event; `rcpt` is invoked per recipient with that
+  recipient last in `/envelope/to`.
 - Registration is cached, renewed on demand near expiry, and recovered once on
   hook HTTP 404/410. Recovery retains the invocation ID and shares its deadline.
-- Requested properties: `/stage`, `/action`, `/timestamp`, `/protocol`,
-  `/rawMessage`, `/envelope`, `/queue`, `/client`. The scanner must confirm this
-  exact profile. Optional metadata depends on the milter events/macros available.
-- HTTP 204 or an empty operation object continues processing. Supported updates:
-  set `/action`, set `/response` or its code/enhancedCode/message fields, and add
-  `/message/headers` with an optional insertion index.
-- Actions: accept (milter CONTINUE), reject (4xx or 5xx reply), discard, quarantine.
-  Quarantine additionally requires the MTA's negotiated quarantine capability.
-- Unsupported paths, operations or actions fail the whole decision; no partial
-  wire edits are sent. The draft's registration schema does not carry the
-  `updateProperties` negotiation mentioned elsewhere, so this adapter uses a
-  fixed local allowlist. A scanner must be configured for that allowlist.
+- Offered properties: `/stage`, `/action`, `/timestamp`, `/protocol`,
+  `/rawMessage`, `/envelope`, `/queue`, `/client`, `/tls`, `/auth`, `/server`.
+  The scanner confirms a subset (at least `/stage` and `/action`; anything
+  outside the offer is refused) and receives only the confirmed properties.
+  `/rawMessage` and `/envelope` are `null` before they exist (before `data` and
+  before `mail`). `/tls`, `/auth`, `/server`, `/queue` and the client PTR and
+  connection count come from milter macros and are `null` when absent.
+  `/senderAuth`, `/message` and `activeConnections` beyond the macro value are
+  not projected.
+- HTTP 204 or an empty operation object continues processing. At the `data`
+  stage the translator supports: set `/action`; set `/response` or its
+  code/enhancedCode/message fields; add `/message/headers` (optional index);
+  set `/message/headers/N` (same name; milter cannot rename) or
+  `/message/headers/N/value`; delete `/message/headers/N`; set `/envelope/from`;
+  add `/envelope/to`; delete `/envelope/to/N`. Header indexes refer to the
+  milter-visible header list (the `rawMessage` headers) as the draft's
+  set/add/delete order leaves them; deletes and changes are emitted before
+  inserts, ordered so occurrence counts stay valid. Earlier stages accept only
+  `/action` and `/response`.
+- Actions: accept (milter CONTINUE), reject (4xx or 5xx reply; at `rcpt` only
+  that recipient), discard (from `mail` onwards), quarantine (`data` only, needs
+  the negotiated capability) and disconnect (`SMFIR_SHUTDOWN`; Postfix answers
+  `421 4.7.0 Server closing connection`).
+- Unsupported paths, operations, actions or stage combinations fail the whole
+  decision; no partial wire edits are sent. The draft's registration schema
+  does not carry the `updateProperties` negotiation mentioned elsewhere, so this
+  adapter uses a fixed local allowlist. A scanner must be configured for it.
 
-No outbound delivery/DSN hooks, disconnect emulation, CBOR, discovery, status
-polling, deregistration, scanner chains, structured MIME projection, body or
-envelope **HTTP update translation**, TLS/auth metadata projection, retry backoff
-or durable registration state yet. The core's lower-level edit API is broader
-than the HTTP translator. Those are explicit follow-up integration areas.
+No outbound delivery/DSN hooks, CBOR, discovery, status polling, scanner chains,
+structured MIME projection, `rawMessage`/body replacement, `/senderAuth`
+projection or durable registration state yet. The core's lower-level edit API
+(body replacement) is broader than the HTTP translator. Those are explicit
+follow-up integration areas.
 
 `rawMessage` is Base64 of the message visible through milter, reconstructed from
 headers and body. Header leading-space negotiation is honoured, but this is not
@@ -293,6 +350,7 @@ macro data, 1,000 modifications, 1 MiB HTTP response and 131,073 bytes per milte
 frame including opcode. Idle expiry is disabled by default; started frames have
 a 60-second absolute deadline. Policy evaluation has 20 seconds, writes 10
 seconds and shutdown draining 30 seconds. See timeout sizing above.
+Header and recipient counts after hook edits are held to the same limits.
 Messages are buffered in memory; raw reconstruction, Base64 and JSON add copies.
 These are per-connection limits, **not** a global memory budget. Tune connection
 and message limits together; disk spooling and global byte admission remain work.

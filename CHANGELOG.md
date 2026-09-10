@@ -2,6 +2,16 @@
 
 ## Unreleased — initial 0.1.0 candidate
 
+- Configurable inbound hook stages (`connect`, `ehlo`, `mail`, `rcpt`, `data`),
+  property negotiation with `/tls`, `/auth` and `/server` projections, and a
+  `disconnect` action mapped to `SMFIR_SHUTDOWN`.
+- Hook response translation for header change/delete, envelope sender change
+  and recipient add/delete, validated atomically with the existing header adds.
+- Bounded hook retries with backoff on transient scanner failures, optional
+  startup registration wait, and deregistration on shutdown.
+- Macro-list requests in the milter negotiation reply and `SMFIR_PROGRESS`
+  keepalives while a policy callback is pending.
+- Unix socket permission bits and opt-in stale socket replacement.
 - Scanner HTTP options for custom CA bundles, mutual TLS, explicit proxy policy,
   connection pooling, bearer/Basic credential files and bounded gzip responses.
 - JSON logs with connection/request correlation; classified failures, operation
@@ -15,8 +25,9 @@
 - Experimental single-scanner MTA Hooks draft-01 JSON/data adapter with
   registration recovery, decision validation and temporary-failure defaults.
 - Low-level header/body/envelope modifications; narrower HTTP update allowlist.
-- 51 Rust tests and real Postfix 3.7.11 coverage: 25 checks for each transport,
-  including a 65-second idle SMTP session followed by another scanned message.
+- 60 Rust tests and real Postfix 3.7.11 coverage: 26 data-only and 33
+  multi-stage checks for each transport, including a 65-second idle SMTP session
+  followed by another scanned message, stage-level rejections and queue edits.
 - Reproducible network-isolated Postfix harness, CI and package-file checks.
 
 The HTTP adapter is not a complete draft implementation. Independent draft-01

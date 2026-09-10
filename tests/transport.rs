@@ -1,6 +1,6 @@
 //! Real HTTP/TLS fixtures using ephemeral certificates and synthetic credentials.
 use mta_hooks_milter::{
-    hooks::HooksClient,
+    hooks::{HooksClient, HooksOptions},
     protocol::{Error, Result},
     server::{Policy, Stats},
     session::{EnvelopeAddress, Limits, Session, Stage},
@@ -218,6 +218,7 @@ async fn client(
         Duration::from_secs(2),
         true,
         options,
+        HooksOptions::default(),
         stats,
     )
     .await
@@ -422,6 +423,7 @@ async fn registration_status_and_timeout_are_classified_without_leaking_urls() {
             Duration::from_millis(100),
             true,
             direct(),
+            HooksOptions::default(),
             stats.clone(),
         )
         .await;

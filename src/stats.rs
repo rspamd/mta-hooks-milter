@@ -36,12 +36,17 @@ pub struct Stats {
     pub connections: AtomicU64,
     pub overload: AtomicU64,
     pub messages: AtomicU64,
+    /// SMFIR_PROGRESS keepalives sent while callbacks were pending.
+    pub progress: AtomicU64,
     pub errors: AtomicU64,
     pub policy_errors: AtomicU64,
+    /// Hook requests repeated after a transient scanner failure.
+    pub hook_retries: AtomicU64,
     pub policy: OperationStats,
     pub registration: OperationStats,
     pub hook: OperationStats,
     pub registration_wait: OperationStats,
+    pub deregistration: OperationStats,
     pub drain_graceful: AtomicU64,
     pub drain_forced: AtomicU64,
     pub(crate) listener: AtomicU8,
@@ -139,8 +144,11 @@ pub struct Observation<'a> {
     outcome: &'static str,
 }
 impl Observation<'_> {
-    pub fn finish<T>(mut self, result: &Result<T>) {
-        self.outcome = result.as_ref().err().map_or("success", Error::kind);
+    pub fn finish<T>(self, result: &Result<T>) {
+        self.finish_error(result.as_ref().err());
+    }
+    pub fn finish_error(mut self, error: Option<&Error>) {
+        self.outcome = error.map_or("success", Error::kind);
     }
 }
 impl Drop for Observation<'_> {
@@ -192,6 +200,11 @@ impl Stats {
                 "counter",
                 self.messages.load(Ordering::Relaxed),
             ),
+            (
+                "progress_total",
+                "counter",
+                self.progress.load(Ordering::Relaxed),
+            ),
             // Retained for compatibility: all connection-driver errors, not only syntax.
             (
                 "protocol_errors_total",
@@ -202,6 +215,11 @@ impl Stats {
                 "policy_errors_total",
                 "counter",
                 self.policy_errors.load(Ordering::Relaxed),
+            ),
+            (
+                "hook_retries_total",
+                "counter",
+                self.hook_retries.load(Ordering::Relaxed),
             ),
             (
                 "ready",
@@ -249,6 +267,7 @@ impl Stats {
             ("registration", &self.registration),
             ("hook", &self.hook),
             ("registration_wait", &self.registration_wait),
+            ("deregistration", &self.deregistration),
         ] {
             op.render(name, &mut output);
         }

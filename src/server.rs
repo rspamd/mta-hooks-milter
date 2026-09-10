@@ -1,6 +1,6 @@
 pub use crate::stats::Stats;
 use crate::{
-    protocol::{self, Error, Result},
+    protocol::{self, Error, MacroLists, Result},
     session::{Decision, Limits, Session, Stage, Verdict},
 };
 use std::{
@@ -14,7 +14,7 @@ use tokio::{
     net::{TcpListener, UnixListener},
     sync::Semaphore,
     task::JoinSet,
-    time::timeout,
+    time::{timeout, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -28,6 +28,11 @@ pub trait Policy: Send + Sync + 'static {
     }
     fn actions(&self) -> u32 {
         protocol::SUPPORTED_ACTIONS
+    }
+    /// Macro lists to request from the MTA during negotiation. The default
+    /// keeps the MTA's own configuration; a non-empty request replaces all of it.
+    fn macros(&self) -> MacroLists {
+        MacroLists::default()
     }
     fn evaluate<'a>(&'a self, stage: Stage, session: &'a Session) -> PolicyFuture<'a>;
 }
@@ -54,6 +59,9 @@ pub struct Config {
     /// Absolute time to finish a frame after its first length byte arrives.
     pub frame_timeout: Duration,
     pub policy_timeout: Duration,
+    /// Send SMFIR_PROGRESS at this interval while a callback is pending so the
+    /// MTA's command/content timers do not expire before the policy deadline.
+    pub progress_interval: Option<Duration>,
     pub write_timeout: Duration,
     pub shutdown_timeout: Duration,
     pub fail_open: bool,
@@ -66,6 +74,7 @@ impl Default for Config {
             idle_timeout: None,
             frame_timeout: Duration::from_secs(60),
             policy_timeout: Duration::from_secs(20),
+            progress_interval: Some(Duration::from_secs(10)),
             write_timeout: Duration::from_secs(10),
             shutdown_timeout: Duration::from_secs(30),
             fail_open: false,
@@ -88,6 +97,7 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<()> {
     let stages = policy.stages();
     let mut session = Session::new(config.limits.clone(), stages.clone(), policy.actions());
+    session.request_macros(policy.macros());
     loop {
         let frame = tokio::select! {
             _=stop.cancelled()=>return Ok(()),
@@ -104,10 +114,11 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             }
             let observation = stages.contains(&stage).then(|| stats.policy.begin());
             let result = if stages.contains(&stage) {
-                timeout(config.policy_timeout, policy.evaluate(stage, &session))
-                    .await
-                    .map_err(|_| Error::Timeout)
-                    .and_then(|r| r)
+                // Any frame already queued (none for callback stages) is flushed first
+                // so progress notifications never interleave with an earlier reply.
+                let deadline = tokio::time::Instant::now() + config.policy_timeout;
+                let evaluation = policy.evaluate(stage, &session);
+                evaluate_with_progress(&mut stream, evaluation, deadline, config, stats).await
             } else {
                 Ok(Decision::default())
             };
@@ -147,6 +158,34 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         .map_err(|_| Error::Timeout)??;
         if step.close {
             return Ok(());
+        }
+    }
+}
+/// Drive a policy future to its deadline, emitting SMFIR_PROGRESS keepalives.
+/// A failed keepalive write is fatal for the connection: the MTA is gone.
+async fn evaluate_with_progress<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    evaluation: PolicyFuture<'_>,
+    deadline: tokio::time::Instant,
+    config: &Config,
+    stats: &Stats,
+) -> Result<Decision> {
+    let mut evaluation = std::pin::pin!(timeout_at(deadline, evaluation));
+    let Some(interval) = config.progress_interval else {
+        return evaluation.await.map_err(|_| Error::Timeout)?;
+    };
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let progress = protocol::Frame::empty(protocol::PROGRESS);
+    loop {
+        tokio::select! {
+            result = &mut evaluation => return result.map_err(|_| Error::Timeout)?,
+            _ = ticker.tick() => {
+                stats.progress.fetch_add(1, Ordering::Relaxed);
+                timeout(config.write_timeout, protocol::write_frame(stream, &progress))
+                    .await
+                    .map_err(|_| Error::Timeout)??;
+            }
         }
     }
 }
