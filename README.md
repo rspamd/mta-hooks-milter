@@ -128,7 +128,9 @@ sets a proxy. A proxy can observe traffic metadata; plaintext development reques
 also expose their credentials and content to it. Authenticated proxies are not
 supported by the explicit proxy option in this pass.
 
-The 1 MiB HTTP response limit applies **after decompression**. Registration and
+Registration responses are limited to 1 MiB **after decompression**. Hook responses
+allow base64 expansion of the configured message limit plus 1 MiB of JSON overhead,
+so bounded raw-message replacements can carry a full message. Registration and
 hook requests share the same configured HTTP client and connection pool.
 The whole invocation, including registration waits and 404/410 recovery, remains
 bounded by `--policy-timeout-ms`; transport settings do not extend that budget.
@@ -291,7 +293,10 @@ Low-level modifications include add/insert/change/delete header, chunked body
 replacement, envelope sender/recipient changes and quarantine. Message edits
 are emitted only at EOM and only with negotiated capability bits. Header insert
 indexes are absolute/zero-based; change/delete occurrences are per-name/one-based.
-Output header values must be unfolded and cannot contain CR, LF or NUL.
+Output header values may contain folded lines (a newline followed by space or
+tab). Bare CR, NUL, other control bytes and newlines introducing a new field are
+rejected. Raw header insertions preserve colon whitespace when leading-space
+support was negotiated; otherwise only the representable single-space form is accepted.
 
 ## Implemented Hooks profile and limits
 
@@ -323,6 +328,13 @@ This is **not a complete draft-01 MTA implementation**. Current adapter behavior
   set/add/delete order leaves them; deletes and changes are emitted before
   inserts, ordered so occurrence counts stay valid. Earlier stages accept only
   `/action` and `/response`.
+- At `data`, set `/rawMessage` replaces the milter-visible message from canonical
+  base64. Identical original fields are retained without reserializing them;
+  changed fields are deleted/inserted and changed bodies use chunked milter body
+  replacement, including explicit empty bodies. Structured `/message` operations
+  are ignored when `/rawMessage` is replaced, as required by draft-01. Envelope
+  and action operations still apply. Size, header-count, modification and
+  negotiated-capability limits are checked before emitting any edits.
 - Actions: accept (milter CONTINUE), reject (4xx or 5xx reply; at `rcpt` only
   that recipient), discard (from `mail` onwards), quarantine (`data` only, needs
   the negotiated capability) and disconnect (`SMFIR_SHUTDOWN`; Postfix answers
@@ -333,10 +345,8 @@ This is **not a complete draft-01 MTA implementation**. Current adapter behavior
   adapter uses a fixed local allowlist. A scanner must be configured for it.
 
 No outbound delivery/DSN hooks, CBOR, discovery, status polling, scanner chains,
-structured MIME projection, `rawMessage`/body replacement, `/senderAuth`
-projection or durable registration state yet. The core's lower-level edit API
-(body replacement) is broader than the HTTP translator. Those are explicit
-follow-up integration areas.
+structured MIME projection, `/senderAuth` projection or durable registration
+state yet. Those are explicit follow-up integration areas.
 
 `rawMessage` is Base64 of the message visible through milter, reconstructed from
 headers and body. Header leading-space negotiation is honoured, but this is not
@@ -346,7 +356,7 @@ cannot be represented by this JSON adapter and triggers its failure policy.
 
 Defaults: 128 connections, 25,000,000 message bytes in the CLI (25 MiB in the
 library defaults), 1 MiB envelope data, 10,000 headers, 1,000 recipients, 64 KiB
-macro data, 1,000 modifications, 1 MiB HTTP response and 131,073 bytes per milter
+macro data, 1,000 modifications, bounded HTTP responses as described above, and 131,073 bytes per milter
 frame including opcode. Idle expiry is disabled by default; started frames have
 a 60-second absolute deadline. Policy evaluation has 20 seconds, writes 10
 seconds and shutdown draining 30 seconds. See timeout sizing above.

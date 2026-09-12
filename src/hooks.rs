@@ -12,6 +12,7 @@ use crate::{
     transport::{Authentication, TransportOptions, http_error},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
@@ -358,7 +359,9 @@ impl HooksClient {
         let mut retries = 0u32;
         loop {
             let observation = self.stats.hook.begin();
-            let result = self.hook(&reg, request_id, &body).await;
+            let response_limit =
+                session.limits.message_bytes.saturating_add(2) / 3 * 4 + self.response_limit;
+            let result = self.hook(&reg, request_id, &body, response_limit).await;
             observation.finish_error(result.as_ref().err().map(|f| &f.error));
             match result {
                 Ok(Some(value)) => return translate(value, session, stage),
@@ -404,6 +407,7 @@ impl HooksClient {
         reg: &Registration,
         request_id: &str,
         body: &Value,
+        response_limit: usize,
     ) -> std::result::Result<Option<Value>, HookFailure> {
         let response = self
             .client
@@ -420,7 +424,7 @@ impl HooksClient {
         match status {
             StatusCode::NO_CONTENT => Ok(None),
             StatusCode::OK => Ok(Some(
-                bounded_json(response, self.response_limit)
+                bounded_json(response, response_limit)
                     .await
                     .map_err(HookFailure::from)?,
             )),
@@ -484,6 +488,7 @@ impl Policy for HooksClient {
     }
     fn actions(&self) -> u32 {
         ADD_HEADERS
+            | crate::protocol::CHANGE_BODY
             | CHANGE_HEADERS
             | QUARANTINE
             | CHANGE_FROM
@@ -1074,7 +1079,120 @@ fn insert_slot(
     Ok(())
 }
 
-/// Narrow update profile. No modification is emitted until the whole response is checked.
+/// Replace the milter-visible message. Keep an ordered subsequence of identical
+/// original fields untouched, preserving their bytes (including signed fields).
+fn raw_replacement(value: &Value, session: &Session) -> Result<Vec<Modification>> {
+    let encoded = value.as_str().ok_or(Error::Invalid("raw message type"))?;
+    if encoded.len() > session.limits.message_bytes.saturating_add(2) / 3 * 4 {
+        return Err(Error::Limit("replacement message"));
+    }
+    let raw = STANDARD
+        .decode(encoded)
+        .map_err(|_| Error::Invalid("raw message base64"))?;
+    if raw.len() > session.limits.message_bytes {
+        return Err(Error::Limit("replacement message"));
+    }
+    let mut fields: Vec<(&[u8], &[u8])> = Vec::new();
+    let mut offset = 0;
+    let body_start = loop {
+        let end = raw[offset..]
+            .iter()
+            .position(|&c| c == b'\n')
+            .map(|n| offset + n)
+            .ok_or(Error::Invalid("raw message headers"))?;
+        let content_end = if end > offset && raw[end - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        let line = &raw[offset..content_end];
+        if line.is_empty() {
+            break end + 1;
+        }
+        if matches!(line.first(), Some(b' ' | b'\t')) {
+            let (_, value) = fields
+                .last_mut()
+                .ok_or(Error::Invalid("orphan continuation"))?;
+            let start = value.as_ptr() as usize - raw.as_ptr() as usize;
+            *value = &raw[start..content_end];
+        } else {
+            let colon = line
+                .iter()
+                .position(|&c| c == b':')
+                .ok_or(Error::Invalid("raw header"))?;
+            let name = &line[..colon];
+            if name.is_empty() || !name.iter().all(|c| (33..=126).contains(c) && *c != b':') {
+                return Err(Error::Invalid("raw header name"));
+            }
+            if fields.len() >= session.limits.headers {
+                return Err(Error::Limit("replacement headers"));
+            }
+            fields.push((name, &raw[offset + colon + 1..content_end]));
+        }
+        offset = end + 1;
+    };
+    let original = &session.message.headers;
+    let mut candidates: std::collections::BTreeMap<(&[u8], &[u8]), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    let mut counts = std::collections::BTreeMap::new();
+    let mut occurrences = Vec::with_capacity(original.len());
+    for (i, (name, value)) in original.iter().enumerate() {
+        candidates
+            .entry((name.as_ref(), value.as_ref()))
+            .or_default()
+            .push(i);
+        let count = counts.entry(name.to_ascii_lowercase()).or_insert(0u32);
+        *count += 1;
+        occurrences.push(*count);
+    }
+    let mut retained = vec![false; original.len()];
+    let mut cursor = 0;
+    let mut inserted = Vec::new();
+    for (position, (name, value)) in fields.into_iter().enumerate() {
+        let lookup = if session.leading_space() || matches!(value.first(), Some(b'\r' | b'\n')) {
+            Some(value)
+        } else {
+            value.strip_prefix(b" ")
+        };
+        let matched = lookup
+            .and_then(|value| candidates.get(&(name, value)))
+            .and_then(|indices| indices.get(indices.partition_point(|&i| i < cursor)))
+            .copied();
+        if let Some(index) = matched {
+            retained[index] = true;
+            cursor = index + 1;
+        } else {
+            inserted.push(Modification::InsertRawHeader {
+                index: position as u32,
+                name: text(name)?.to_owned(),
+                value: text(value)?.to_owned(),
+            });
+        }
+    }
+    let mut result = Vec::new();
+    for i in (0..original.len()).rev() {
+        if !retained[i] {
+            let name = text(&original[i].0)?;
+            result.push(Modification::ChangeHeader {
+                occurrence: occurrences[i],
+                name: name.to_owned(),
+                value: String::new(),
+            });
+        }
+    }
+    result.extend(inserted);
+    if raw[body_start..] != session.message.body {
+        result.push(Modification::ReplaceBody(Bytes::copy_from_slice(
+            &raw[body_start..],
+        )));
+    }
+    if result.len() > session.limits.modifications {
+        return Err(Error::Limit("replacement modifications"));
+    }
+    Ok(result)
+}
+
+/// No modification is emitted until the whole response is checked.
 pub fn translate(value: Value, session: &Session, stage: Stage) -> Result<Decision> {
     let ops: Operations =
         serde_json::from_value(value).map_err(|_| Error::Invalid("hook response schema"))?;
@@ -1087,8 +1205,20 @@ pub fn translate(value: Value, session: &Session, stage: Stage) -> Result<Decisi
     let mut action = "accept".to_owned();
     let mut response = Value::Null;
     let mut edits = Edits::new(session);
+    let mut raw = None;
+    let has_raw = ops
+        .set
+        .as_ref()
+        .is_some_and(|sets| sets.iter().any(|s| s.path == "/rawMessage"));
     for set in ops.set.unwrap_or_default() {
         match set.path.as_str() {
+            "/rawMessage" => {
+                if raw.is_some() {
+                    return Err(Error::Invalid("duplicate raw message replacement"));
+                }
+                raw = Some(raw_replacement(&set.value, session)?);
+            }
+            path if has_raw && (path == "/message" || path.starts_with("/message/")) => {}
             "/action" => {
                 action = set
                     .value
@@ -1112,17 +1242,26 @@ pub fn translate(value: Value, session: &Session, stage: Stage) -> Result<Decisi
         }
     }
     for add in ops.add.unwrap_or_default() {
+        if has_raw && (add.path == "/message" || add.path.starts_with("/message/")) {
+            continue;
+        }
         edits.add(session, add)?;
     }
     for delete in ops.delete.unwrap_or_default() {
+        if has_raw && (delete.path == "/message" || delete.path.starts_with("/message/")) {
+            continue;
+        }
         edits.delete(&delete.path)?;
     }
-    if stage != Stage::EndMessage && !edits.is_empty() {
+    if stage != Stage::EndMessage && (!edits.is_empty() || raw.is_some()) {
         return Err(Error::Invalid(
             "message and envelope edits require the data stage",
         ));
     }
     let mut modifications = edits.modifications(session)?;
+    if let Some(raw) = raw {
+        modifications.extend(raw);
+    }
     for m in &modifications {
         m.frames(session.leading_space())?;
     }

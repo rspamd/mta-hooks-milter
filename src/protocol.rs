@@ -458,6 +458,12 @@ pub enum Modification {
         value: String,
     },
     ReplaceBody(Bytes),
+    /// Field value includes its exact whitespace after the colon.
+    InsertRawHeader {
+        index: u32,
+        name: String,
+        value: String,
+    },
     ChangeFrom {
         address: String,
         parameters: Option<String>,
@@ -472,7 +478,9 @@ pub enum Modification {
 impl Modification {
     pub fn capability(&self) -> u32 {
         match self {
-            Self::AddHeader { .. } | Self::InsertHeader { .. } => ADD_HEADERS,
+            Self::AddHeader { .. } | Self::InsertHeader { .. } | Self::InsertRawHeader { .. } => {
+                ADD_HEADERS
+            }
             Self::ChangeHeader { .. } => CHANGE_HEADERS,
             Self::ReplaceBody(_) => CHANGE_BODY,
             Self::ChangeFrom { .. } => CHANGE_FROM,
@@ -489,6 +497,7 @@ impl Modification {
     pub fn payload_bytes(&self, leading_space: bool) -> Result<usize> {
         let parts = match self {
             Self::ReplaceBody(body) => [body.len(), 0, 0, 0],
+            Self::InsertRawHeader { name, value, .. } => [name.len(), value.len(), 6, 0],
             Self::AddHeader { name, value }
             | Self::InsertHeader { name, value, .. }
             | Self::ChangeHeader { name, value, .. } => [
@@ -522,6 +531,23 @@ impl Modification {
     }
     pub fn frames(&self, leading_space: bool) -> Result<Vec<Frame>> {
         match self {
+            Self::InsertRawHeader { index, name, value } => {
+                if name.is_empty() || !name.bytes().all(|c| (33..=126).contains(&c) && c != b':') {
+                    return Err(Error::Invalid("header name"));
+                }
+                header_value(value)?;
+                let value = if leading_space {
+                    value.as_str()
+                } else {
+                    value.strip_prefix(' ').ok_or(Error::Invalid(
+                        "raw header whitespace requires leading-space negotiation",
+                    ))?
+                };
+                let frame = string_frame(b'i', &[name.as_bytes(), value.as_bytes()])?;
+                let mut payload = index.to_be_bytes().to_vec();
+                payload.extend_from_slice(&frame.payload);
+                Ok(vec![Frame::new(b'i', payload)])
+            }
             Self::ReplaceBody(body) => {
                 if body.is_empty() {
                     return Ok(vec![Frame::empty(b'b')]);
@@ -537,8 +563,7 @@ impl Modification {
                 if name.is_empty() || !name.bytes().all(|c| (33..=126).contains(&c) && c != b':') {
                     return Err(Error::Invalid("header name"));
                 }
-                // Unfolded output values only; raw input headers retain their bytes.
-                clean(value)?;
+                header_value(value)?;
                 let value = if leading_space && !value.is_empty() {
                     format!(" {value}")
                 } else {
@@ -601,6 +626,31 @@ impl Modification {
         }
     }
 }
+/// Permit RFC 5322 folding, but never a new field or a bare CR.
+pub fn header_value(value: &str) -> Result<()> {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let mut c = bytes[i];
+        if c == b'\r' {
+            i += 1;
+            if bytes.get(i) != Some(&b'\n') {
+                return Err(Error::Invalid("header folding"));
+            }
+            c = b'\n';
+        }
+        if c == b'\n' {
+            if !matches!(bytes.get(i + 1), Some(b' ' | b'\t')) {
+                return Err(Error::Invalid("header folding"));
+            }
+        } else if (c < 32 && c != b'\t') || c == 127 {
+            return Err(Error::Invalid("header control character"));
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 pub fn clean(value: &str) -> Result<()> {
     if value.bytes().any(|c| matches!(c, 0 | b'\r' | b'\n')) {
         return Err(Error::Invalid("control character in response"));

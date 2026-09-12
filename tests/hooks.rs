@@ -1,6 +1,82 @@
+use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use mta_hooks_milter::{hooks::translate, protocol::*, session::*};
 use serde_json::json;
+
+#[test]
+fn raw_replacement_preserves_original_fields_and_replaces_binary_or_empty_body() {
+    for body in [b"new\0binary\r\n".as_slice(), b"".as_slice()] {
+        let mut s = at_eom_with_headers();
+        s.message.body = b"old\r\n".to_vec();
+        let mut raw = s.raw_message();
+        raw.truncate(raw.len() - s.message.body.len());
+        raw.extend_from_slice(body);
+        let d = translate(
+            json!({"set":[{"path":"/rawMessage","value":STANDARD.encode(raw)}],
+            "add":[{"path":"/message/headers","value":{"name":"Ignored","value":"yes"}}]}),
+            &s,
+            Stage::EndMessage,
+        )
+        .unwrap();
+        assert_eq!(
+            d.modifications,
+            vec![Modification::ReplaceBody(Bytes::copy_from_slice(body))]
+        );
+        let frames = s.complete(d).unwrap();
+        assert_eq!(frames[0].command, b'b');
+        assert_eq!(frames[0].payload.as_ref(), body);
+    }
+}
+
+#[test]
+fn raw_replacement_header_edits_and_invalid_inputs_are_atomic() {
+    let s = at_eom_with_headers();
+    let raw = b"Subject: replaced\r\nDKIM-Signature: v=1;\r\n\tb=signature\r\n\r\nnew\r\n";
+    let d = translate(
+        json!({"set":[{"path":"/rawMessage","value":STANDARD.encode(raw)}]}),
+        &s,
+        Stage::EndMessage,
+    )
+    .unwrap();
+    assert!(d.modifications.iter().any(
+        |m| matches!(m, Modification::InsertRawHeader {name, ..} if name == "DKIM-Signature")
+    ));
+    for m in &d.modifications {
+        m.frames(false).unwrap();
+    }
+    for raw in [
+        b"orphan\r\n\r\nx".as_slice(),
+        b" folded\r\n\r\nx",
+        b"X: bad\rvalue\r\n\r\nx",
+    ] {
+        assert!(
+            translate(
+                json!({"set":[{"path":"/rawMessage","value":STANDARD.encode(raw)}]}),
+                &s,
+                Stage::EndMessage
+            )
+            .is_err()
+        );
+    }
+    let mut small = at_eom_with_headers();
+    small.limits.message_bytes = 2;
+    assert!(
+        translate(
+            json!({"set":[{"path":"/rawMessage","value":STANDARD.encode(raw)}]}),
+            &small,
+            Stage::EndMessage
+        )
+        .is_err()
+    );
+    assert!(
+        translate(
+            json!({"set":[{"path":"/rawMessage","value":STANDARD.encode(raw)}]}),
+            &s,
+            Stage::Connect
+        )
+        .is_err()
+    );
+}
 
 fn at_eom(actions: u32) -> Session {
     let mut session = Session::new(Limits::default(), vec![Stage::EndMessage], actions);

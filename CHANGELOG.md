@@ -2,6 +2,10 @@
 
 ## Unreleased — initial 0.1.0 candidate
 
+- Raw-message response translation with bounded header/body replacement,
+  explicit empty bodies and preservation of unchanged original fields.
+- Folded output headers (including DKIM signatures) with field-injection checks,
+  and body-replacement capability negotiation for the HTTP scanner policy.
 - Configurable inbound hook stages (`connect`, `ehlo`, `mail`, `rcpt`, `data`),
   property negotiation with `/tls`, `/auth` and `/server` projections, and a
   `disconnect` action mapped to `SMFIR_SHUTDOWN`.
